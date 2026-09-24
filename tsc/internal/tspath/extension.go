@@ -20,6 +20,7 @@ const (
 	ExtensionCjs         = ".cjs"
 	ExtensionCts         = ".cts"
 	ExtensionDcts        = ".d.cts"
+	ExtensionZig         = ".zig"
 )
 
 var (
@@ -36,8 +37,11 @@ var (
 	SupportedTSExtensionsWithJsonFlat        = slices.Concat(SupportedTSExtensionsFlat, []string{ExtensionJson})
 	// SupportedTSExtensionsWithWat additionally recognizes WebAssembly text (`.wat`) files, which are parsed as
 	// TypeScript modules describing the exports of the WebAssembly module.
-	SupportedTSExtensionsWithWat                   = slices.Concat(SupportedTSExtensions, [][]string{{ExtensionWat}})
-	AllSupportedExtensionsWithWat                  = slices.Concat(AllSupportedExtensions, [][]string{{ExtensionWat}})
+	SupportedTSExtensionsWithWat  = slices.Concat(SupportedTSExtensions, [][]string{{ExtensionWat}})
+	AllSupportedExtensionsWithWat = slices.Concat(AllSupportedExtensions, [][]string{{ExtensionWat}})
+
+	SupportedTSExtensionsWithZig                   = slices.Concat(SupportedTSExtensions, [][]string{{ExtensionZig}})
+	AllSupportedExtensionsWithZig                  = slices.Concat(AllSupportedExtensions, [][]string{{ExtensionZig}})
 	ExtensionsNotSupportingExtensionlessResolution = []string{ExtensionMts, ExtensionDmts, ExtensionMjs, ExtensionCts, ExtensionDcts, ExtensionCjs}
 )
 

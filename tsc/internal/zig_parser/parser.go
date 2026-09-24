@@ -1,4 +1,4 @@
-package parser
+package zig_parser
 
 import (
 	"slices"
@@ -11,10 +11,9 @@ import (
 	"github.com/microsoft/TypeScript/tsc/internal/core"
 	"github.com/microsoft/TypeScript/tsc/internal/debug"
 	"github.com/microsoft/TypeScript/tsc/internal/diagnostics"
-	"github.com/microsoft/TypeScript/tsc/internal/scanner"
 	"github.com/microsoft/TypeScript/tsc/internal/stringutil"
 	"github.com/microsoft/TypeScript/tsc/internal/tspath"
-	"github.com/microsoft/TypeScript/tsc/internal/zig_parser"
+	scanner "github.com/microsoft/TypeScript/tsc/internal/zig_scanner"
 )
 
 type ParsingContext int
@@ -135,11 +134,6 @@ func putParser(p *Parser) {
 }
 
 func ParseSourceFile(opts ast.SourceFileParseOptions, sourceText string, scriptKind core.ScriptKind) *ast.SourceFile {
-	if strings.HasSuffix(opts.FileName, ".zig") {
-		return zig_parser.ParseSourceFile(opts, sourceText, scriptKind)
-
-	}
-
 	p := getParser()
 	defer putParser(p)
 	p.initializeState(opts, sourceText, scriptKind)

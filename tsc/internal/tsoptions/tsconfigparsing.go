@@ -2029,9 +2029,9 @@ func GetSupportedExtensions(compilerOptions *core.CompilerOptions, extraExtensio
 	// exports of the compiled WebAssembly module.
 	var builtins [][]string
 	if needJSExtensions {
-		builtins = tspath.AllSupportedExtensionsWithWat
+		builtins = tspath.AllSupportedExtensionsWithZig
 	} else {
-		builtins = tspath.SupportedTSExtensionsWithWat
+		builtins = tspath.SupportedTSExtensionsWithZig
 	}
 	if len(extraExtensions) == 0 {
 		return builtins

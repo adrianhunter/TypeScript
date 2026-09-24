@@ -16,4 +16,6 @@ const (
 	ScriptKindJSON ScriptKind = 6
 
 	// Value 7 is reserved (formerly ScriptKindDeferred).
+
+	ScriptKindZig ScriptKind = 8
 )
