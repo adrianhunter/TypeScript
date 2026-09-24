@@ -11,9 +11,9 @@ import (
 	"github.com/microsoft/TypeScript/tsc/internal/core"
 	"github.com/microsoft/TypeScript/tsc/internal/debug"
 	"github.com/microsoft/TypeScript/tsc/internal/diagnostics"
+	"github.com/microsoft/TypeScript/tsc/internal/scanner"
 	"github.com/microsoft/TypeScript/tsc/internal/stringutil"
 	"github.com/microsoft/TypeScript/tsc/internal/tspath"
-	scanner "github.com/microsoft/TypeScript/tsc/internal/zig_scanner"
 )
 
 type ParsingContext int
@@ -133,7 +133,10 @@ func putParser(p *Parser) {
 	parserPool.Put(p)
 }
 
-func ParseSourceFile(opts ast.SourceFileParseOptions, sourceText string, scriptKind core.ScriptKind) *ast.SourceFile {
+// parseTypeScriptSourceFile parses generated or hand written TypeScript. It is
+// the backend used by ParseSourceFile after a Zig source file has been lowered
+// to TypeScript, but is also usable directly.
+func parseTypeScriptSourceFile(opts ast.SourceFileParseOptions, sourceText string, scriptKind core.ScriptKind) *ast.SourceFile {
 	p := getParser()
 	defer putParser(p)
 	p.initializeState(opts, sourceText, scriptKind)

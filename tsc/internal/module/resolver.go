@@ -1538,6 +1538,12 @@ func (r *resolutionState) tryAddingExtensions(extensionless string, extensions e
 				return resolved
 			}
 		}
+		if originalExtension == "" && extensions&extensionsTypeScript != 0 {
+			// Extensionless imports may resolve to a Zig source file.
+			if resolved := r.tryExtension(tspath.ExtensionZig, extensionless, false); !resolved.shouldContinueSearching() {
+				return resolved
+			}
+		}
 		if r.isConfigLookup {
 			if resolved := r.tryExtension(tspath.ExtensionJson, extensionless, false); !resolved.shouldContinueSearching() {
 				return resolved
@@ -1549,6 +1555,13 @@ func (r *resolutionState) tryAddingExtensions(extensionless string, extensions e
 			extensions&(extensionsTypeScript|extensionsDeclaration) != 0 {
 			// A fully specified import of a WebAssembly text file resolves directly to the `.wat` source.
 			if resolved := r.tryExtension(tspath.ExtensionWat, extensionless, false); !resolved.shouldContinueSearching() {
+				return resolved
+			}
+		}
+		if originalExtension == tspath.ExtensionZig &&
+			extensions&(extensionsTypeScript|extensionsDeclaration) != 0 {
+			// A fully specified import of a Zig source file resolves directly to the `.zig` source.
+			if resolved := r.tryExtension(tspath.ExtensionZig, extensionless, false); !resolved.shouldContinueSearching() {
 				return resolved
 			}
 		}

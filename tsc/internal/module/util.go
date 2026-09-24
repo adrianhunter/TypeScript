@@ -189,7 +189,7 @@ func TryGetJSExtensionForFile(fileName string, options *core.CompilerOptions) st
 			return tspath.ExtensionJsx
 		}
 		return tspath.ExtensionJs
-	case tspath.ExtensionWat:
+	case tspath.ExtensionWat, tspath.ExtensionZig:
 		return tspath.ExtensionJs
 	case tspath.ExtensionJs, tspath.ExtensionJsx, tspath.ExtensionJson:
 		return ext
