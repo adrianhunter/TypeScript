@@ -194,6 +194,11 @@ func (e *emitter) emitJSFile(sourceFile *ast.SourceFile, jsFilePath string, sour
 		defer e.tr.Push(tracing.PhaseEmit, "emitJsFileOrBundle", map[string]any{"jsFilePath": jsFilePath}, true)()
 	}
 
+	if tspath.FileExtensionIs(sourceFile.FileName(), tspath.ExtensionWat) {
+		e.emitWatJSFile(sourceFile, jsFilePath)
+		return
+	}
+
 	emitContext, putEmitContext := printer.GetEmitContext()
 	defer putEmitContext()
 
@@ -229,6 +234,11 @@ func (e *emitter) emitDeclarationFile(sourceFile *ast.SourceFile, declarationFil
 
 	if e.tr != nil {
 		defer e.tr.Push(tracing.PhaseEmit, "emitDeclarationFileOrBundle", map[string]any{"declarationFilePath": declarationFilePath}, true)()
+	}
+
+	if tspath.FileExtensionIs(sourceFile.FileName(), tspath.ExtensionWat) {
+		e.emitWatDeclarationFile(sourceFile, declarationFilePath)
+		return
 	}
 
 	emitContext, putEmitContext := printer.GetEmitContext()

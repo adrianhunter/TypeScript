@@ -10,8 +10,8 @@ import {
     diagnostics,
 } from "./helpers.ts";
 
-before(() => {
-    buildTsc();
+before(async () => {
+    await buildTsc();
 });
 
 describe("module expressions", () => {

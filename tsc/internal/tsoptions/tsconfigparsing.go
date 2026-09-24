@@ -2025,11 +2025,13 @@ func getFileNamesFromConfigSpecs(
 
 func GetSupportedExtensions(compilerOptions *core.CompilerOptions, extraExtensions []string) [][]string {
 	needJSExtensions := compilerOptions.GetAllowJS()
+	// WebAssembly text (`.wat`) files are always supported: they are parsed as TypeScript modules describing the
+	// exports of the compiled WebAssembly module.
 	var builtins [][]string
 	if needJSExtensions {
-		builtins = tspath.AllSupportedExtensions
+		builtins = tspath.AllSupportedExtensionsWithWat
 	} else {
-		builtins = tspath.SupportedTSExtensions
+		builtins = tspath.SupportedTSExtensionsWithWat
 	}
 	if len(extraExtensions) == 0 {
 		return builtins

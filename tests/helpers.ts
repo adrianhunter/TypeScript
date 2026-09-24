@@ -4,6 +4,8 @@ import {
     mkdirSync,
     mkdtempSync,
     readFileSync,
+    renameSync,
+    rmSync,
     writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -14,12 +16,26 @@ export const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)
 export const tscDir = path.join(repoRoot, "tsc");
 export const tscBin = path.join(tscDir, "tsc");
 
-/** Builds the `tsc` CLI from the current sources so the tests always exercise the checked-in implementation. */
-export function buildTsc(): void {
-    const result = spawnSync("go", ["build", "-o", "tsc", "./cmd/tsc"], { cwd: tscDir, encoding: "utf8" });
-    if (result.status !== 0) {
-        throw new Error(`Failed to build tsc:\n${result.stdout}\n${result.stderr}`);
-    }
+let buildPromise: Promise<void> | undefined;
+
+/**
+ * Builds the `tsc` CLI from the current sources so the tests always exercise the checked-in implementation.
+ * The build is deduplicated within a process and written atomically so that concurrently-running test files
+ * do not clobber each other's output.
+ */
+export function buildTsc(): Promise<void> {
+    buildPromise ??= new Promise<void>((resolve, reject) => {
+        const tempBin = `${tscBin}.${process.pid}`;
+        const result = spawnSync("go", ["build", "-o", tempBin, "./cmd/tsc"], { cwd: tscDir, encoding: "utf8" });
+        if (result.status !== 0) {
+            rmSync(tempBin, { force: true });
+            reject(new Error(`Failed to build tsc:\n${result.stdout}\n${result.stderr}`));
+            return;
+        }
+        renameSync(tempBin, tscBin);
+        resolve();
+    });
+    return buildPromise;
 }
 
 export interface CompileResult {
@@ -51,7 +67,11 @@ const defaultCompilerOptions = {
  * Writes the provided files into a fresh temporary directory, runs the `tsc` CLI against them, and returns the
  * diagnostics together with helpers for inspecting the emitted output.
  */
-export function compile(files: Record<string, string>, compilerOptions: Record<string, unknown> = {}): CompileResult {
+export function compile(
+    files: Record<string, string>,
+    compilerOptions: Record<string, unknown> = {},
+    configOverrides: Record<string, unknown> = {},
+): CompileResult {
     const dir = mkdtempSync(path.join(tmpdir(), "ts-module-expressions-"));
 
     for (const [fileName, contents] of Object.entries(files)) {
@@ -65,6 +85,7 @@ export function compile(files: Record<string, string>, compilerOptions: Record<s
         JSON.stringify({
             compilerOptions: { ...defaultCompilerOptions, ...compilerOptions },
             files: Object.keys(files),
+            ...configOverrides,
         }),
     );
 

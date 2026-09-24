@@ -1545,6 +1545,13 @@ func (r *resolutionState) tryAddingExtensions(extensionless string, extensions e
 		}
 		return continueSearching()
 	default:
+		if originalExtension == tspath.ExtensionWat &&
+			extensions&(extensionsTypeScript|extensionsDeclaration) != 0 {
+			// A fully specified import of a WebAssembly text file resolves directly to the `.wat` source.
+			if resolved := r.tryExtension(tspath.ExtensionWat, extensionless, false); !resolved.shouldContinueSearching() {
+				return resolved
+			}
+		}
 		if slices.Contains(r.resolver.extraExtensions, originalExtension) {
 			// A fully specified import of an extraExtension resolves directly to the file.
 			if resolved := r.tryExtension(originalExtension, extensionless, false); !resolved.shouldContinueSearching() {

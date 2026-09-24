@@ -908,7 +908,7 @@ func (p *fileLoader) resolveImportsAndModuleAugmentations(t *parseTask) {
 			resolvedFileName := resolvedModule.ResolvedFileName
 			isFromNodeModulesSearch := resolvedModule.IsExternalLibraryImport
 			// Don't treat redirected files as JS files.
-			isJsFile := !resolvedModule.ResolvedUsingExtraExtensions && !tspath.FileExtensionIsOneOf(resolvedFileName, tspath.SupportedTSExtensionsWithJsonFlat) && p.projectReferenceFileMapper.getRedirectParsedCommandLineForResolution(ast.NewHasFileName(resolvedFileName, p.toPath(resolvedFileName))) == nil
+			isJsFile := !resolvedModule.ResolvedUsingExtraExtensions && !tspath.FileExtensionIs(resolvedFileName, tspath.ExtensionWat) && !tspath.FileExtensionIsOneOf(resolvedFileName, tspath.SupportedTSExtensionsWithJsonFlat) && p.projectReferenceFileMapper.getRedirectParsedCommandLineForResolution(ast.NewHasFileName(resolvedFileName, p.toPath(resolvedFileName))) == nil
 			isJsFileFromNodeModules := isFromNodeModulesSearch && isJsFile && strings.Contains(resolvedFileName, "/node_modules/")
 
 			// add file to program only if:

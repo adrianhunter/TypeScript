@@ -12,6 +12,7 @@ const (
 	ExtensionJs          = ".js"
 	ExtensionJsx         = ".jsx"
 	ExtensionJson        = ".json"
+	ExtensionWat         = ".wat"
 	ExtensionTsBuildInfo = ".tsbuildinfo"
 	ExtensionMjs         = ".mjs"
 	ExtensionMts         = ".mts"
@@ -22,17 +23,21 @@ const (
 )
 
 var (
-	SupportedDeclarationExtensions                 = []string{ExtensionDts, ExtensionDcts, ExtensionDmts}
-	SupportedTSImplementationExtensions            = []string{ExtensionTs, ExtensionTsx, ExtensionMts, ExtensionCts}
-	supportedTSExtensionsForExtractExtension       = []string{ExtensionDts, ExtensionDcts, ExtensionDmts, ExtensionTs, ExtensionTsx, ExtensionMts, ExtensionCts}
-	AllSupportedExtensions                         = [][]string{{ExtensionTs, ExtensionTsx, ExtensionDts, ExtensionJs, ExtensionJsx}, {ExtensionCts, ExtensionDcts, ExtensionCjs}, {ExtensionMts, ExtensionDmts, ExtensionMjs}}
-	SupportedTSExtensions                          = [][]string{{ExtensionTs, ExtensionTsx, ExtensionDts}, {ExtensionCts, ExtensionDcts}, {ExtensionMts, ExtensionDmts}}
-	SupportedTSExtensionsFlat                      = []string{ExtensionTs, ExtensionTsx, ExtensionDts, ExtensionCts, ExtensionDcts, ExtensionMts, ExtensionDmts}
-	SupportedJSExtensions                          = [][]string{{ExtensionJs, ExtensionJsx}, {ExtensionMjs}, {ExtensionCjs}}
-	SupportedJSExtensionsFlat                      = []string{ExtensionJs, ExtensionJsx, ExtensionMjs, ExtensionCjs}
-	AllSupportedExtensionsWithJson                 = slices.Concat(AllSupportedExtensions, [][]string{{ExtensionJson}})
-	SupportedTSExtensionsWithJson                  = slices.Concat(SupportedTSExtensions, [][]string{{ExtensionJson}})
-	SupportedTSExtensionsWithJsonFlat              = slices.Concat(SupportedTSExtensionsFlat, []string{ExtensionJson})
+	SupportedDeclarationExtensions           = []string{ExtensionDts, ExtensionDcts, ExtensionDmts}
+	SupportedTSImplementationExtensions      = []string{ExtensionTs, ExtensionTsx, ExtensionMts, ExtensionCts}
+	supportedTSExtensionsForExtractExtension = []string{ExtensionDts, ExtensionDcts, ExtensionDmts, ExtensionTs, ExtensionTsx, ExtensionMts, ExtensionCts}
+	AllSupportedExtensions                   = [][]string{{ExtensionTs, ExtensionTsx, ExtensionDts, ExtensionJs, ExtensionJsx}, {ExtensionCts, ExtensionDcts, ExtensionCjs}, {ExtensionMts, ExtensionDmts, ExtensionMjs}}
+	SupportedTSExtensions                    = [][]string{{ExtensionTs, ExtensionTsx, ExtensionDts}, {ExtensionCts, ExtensionDcts}, {ExtensionMts, ExtensionDmts}}
+	SupportedTSExtensionsFlat                = []string{ExtensionTs, ExtensionTsx, ExtensionDts, ExtensionCts, ExtensionDcts, ExtensionMts, ExtensionDmts}
+	SupportedJSExtensions                    = [][]string{{ExtensionJs, ExtensionJsx}, {ExtensionMjs}, {ExtensionCjs}}
+	SupportedJSExtensionsFlat                = []string{ExtensionJs, ExtensionJsx, ExtensionMjs, ExtensionCjs}
+	AllSupportedExtensionsWithJson           = slices.Concat(AllSupportedExtensions, [][]string{{ExtensionJson}})
+	SupportedTSExtensionsWithJson            = slices.Concat(SupportedTSExtensions, [][]string{{ExtensionJson}})
+	SupportedTSExtensionsWithJsonFlat        = slices.Concat(SupportedTSExtensionsFlat, []string{ExtensionJson})
+	// SupportedTSExtensionsWithWat additionally recognizes WebAssembly text (`.wat`) files, which are parsed as
+	// TypeScript modules describing the exports of the WebAssembly module.
+	SupportedTSExtensionsWithWat                   = slices.Concat(SupportedTSExtensions, [][]string{{ExtensionWat}})
+	AllSupportedExtensionsWithWat                  = slices.Concat(AllSupportedExtensions, [][]string{{ExtensionWat}})
 	ExtensionsNotSupportingExtensionlessResolution = []string{ExtensionMts, ExtensionDmts, ExtensionMjs, ExtensionCts, ExtensionDcts, ExtensionCjs}
 )
 
@@ -40,7 +45,7 @@ func ExtensionIsTs(ext string) bool {
 	return ext == ExtensionTs || ext == ExtensionTsx || ext == ExtensionDts || ext == ExtensionMts || ext == ExtensionDmts || ext == ExtensionCts || ext == ExtensionDcts || len(ext) >= 7 && ext[:3] == ".d." && ext[len(ext)-3:] == ".ts"
 }
 
-var extensionsToRemove = []string{ExtensionDts, ExtensionDmts, ExtensionDcts, ExtensionMjs, ExtensionMts, ExtensionCjs, ExtensionCts, ExtensionTs, ExtensionJs, ExtensionTsx, ExtensionJsx, ExtensionJson}
+var extensionsToRemove = []string{ExtensionDts, ExtensionDmts, ExtensionDcts, ExtensionMjs, ExtensionMts, ExtensionCjs, ExtensionCts, ExtensionTs, ExtensionJs, ExtensionTsx, ExtensionJsx, ExtensionJson, ExtensionWat}
 
 func RemoveFileExtension(path string) string {
 	// Remove any known extension even if it has more than one dot

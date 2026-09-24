@@ -34,6 +34,8 @@ var LibMap = collections.NewOrderedMapFromList([]collections.MapEntry[string, an
 	{Key: "webworker.iterable", Value: "lib.webworker.iterable.d.ts"},
 	{Key: "webworker.asynciterable", Value: "lib.webworker.asynciterable.d.ts"},
 	{Key: "scripthost", Value: "lib.scripthost.d.ts"},
+	// WebAssembly text (`.wat`) support
+	{Key: "wasm_builtins", Value: "lib.wasm_builtins.d.ts"},
 	// ES2015 and later By-feature options
 	{Key: "es2015.core", Value: "lib.es2015.core.d.ts"},
 	{Key: "es2015.collection", Value: "lib.es2015.collection.d.ts"},

@@ -215,6 +215,8 @@ var (
 	libs_lib_esnext_typedarrays_d_ts string
 	//go:embed libs/lib.scripthost.d.ts
 	libs_lib_scripthost_d_ts string
+	//go:embed libs/lib.wasm_builtins.d.ts
+	libs_lib_wasm_builtins_d_ts string
 	//go:embed libs/lib.webworker.asynciterable.d.ts
 	libs_lib_webworker_asynciterable_d_ts string
 	//go:embed libs/lib.webworker.d.ts
@@ -330,6 +332,7 @@ var embeddedContents = map[string]string{
 	"libs/lib.esnext.temporal.d.ts":         libs_lib_esnext_temporal_d_ts,
 	"libs/lib.esnext.typedarrays.d.ts":      libs_lib_esnext_typedarrays_d_ts,
 	"libs/lib.scripthost.d.ts":              libs_lib_scripthost_d_ts,
+	"libs/lib.wasm_builtins.d.ts":           libs_lib_wasm_builtins_d_ts,
 	"libs/lib.webworker.asynciterable.d.ts": libs_lib_webworker_asynciterable_d_ts,
 	"libs/lib.webworker.d.ts":               libs_lib_webworker_d_ts,
 	"libs/lib.webworker.importscripts.d.ts": libs_lib_webworker_importscripts_d_ts,

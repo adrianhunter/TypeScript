@@ -137,6 +137,9 @@ func ParseSourceFile(opts ast.SourceFileParseOptions, sourceText string, scriptK
 	p := getParser()
 	defer putParser(p)
 	p.initializeState(opts, sourceText, scriptKind)
+	if tspath.FileExtensionIs(opts.FileName, tspath.ExtensionWat) {
+		return p.parseWatSourceFile()
+	}
 	p.nextToken()
 	if p.scriptKind == core.ScriptKindJSON {
 		return p.parseJSONText()

@@ -109,6 +109,7 @@ var LibNames = []string{
 	"lib.esnext.temporal.d.ts",
 	"lib.esnext.typedarrays.d.ts",
 	"lib.scripthost.d.ts",
+	"lib.wasm_builtins.d.ts",
 	"lib.webworker.asynciterable.d.ts",
 	"lib.webworker.d.ts",
 	"lib.webworker.importscripts.d.ts",
