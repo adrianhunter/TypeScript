@@ -5,7 +5,6 @@ package tstransforms
 import (
 	"slices"
 	"strings"
-	"strings"
 
 	"github.com/microsoft/TypeScript/tsc/internal/ast"
 	"github.com/microsoft/TypeScript/tsc/internal/binder"
@@ -28,6 +27,11 @@ type RuntimeSyntaxTransformer struct {
 	currentNamespace                    *ast.ModuleDeclarationNode
 	resolver                            binder.ReferenceResolver
 	emitResolver                        printer.EmitResolver
+	// explicitFragmentReExports caches the names explicitly re-exported from a module declaration at the top level
+	// of the file, used to avoid emitting duplicate exports alongside `export * from Fragment`.
+	explicitFragmentReExports map[string]bool
+	// starFragmentReExports tracks names already re-exported via `export * from Fragment`.
+	starFragmentReExports map[string]bool
 }
 
 func NewRuntimeSyntaxTransformer(opt *transformers.TransformOptions) *transformers.Transformer {
@@ -85,7 +89,7 @@ func (tx *RuntimeSyntaxTransformer) visit(node *ast.Node) *ast.Node {
 	savedCurrentScope, savedCurrentScopeFirstDeclarationsOfName := tx.pushScope(node)
 	defer tx.popScope(savedCurrentScope, savedCurrentScopeFirstDeclarationsOfName)
 
-	isModuleFragmentImport := ast.IsImportDeclaration(node) && ast.IsIdentifier(node.ModuleSpecifier())
+	isModuleFragmentImport := isModuleFragmentImportOrExport(node)
 
 	if node.SubtreeFacts()&ast.SubtreeContainsTypeScript == 0 && !isModuleFragmentImport && (tx.currentNamespace == nil && tx.currentEnum == nil || node.SubtreeFacts()&ast.SubtreeContainsIdentifier == 0) {
 		return node
@@ -102,7 +106,11 @@ func (tx *RuntimeSyntaxTransformer) visit(node *ast.Node) *ast.Node {
 	case ast.KindEnumDeclaration:
 		node = tx.visitEnumDeclaration(node.AsEnumDeclaration())
 	case ast.KindModuleDeclaration:
-		node = tx.visitModuleDeclaration(node.AsModuleDeclaration())
+		if node.Flags&ast.NodeFlagsModuleFragment != 0 {
+			node = tx.visitModuleFragment(node.AsModuleDeclaration())
+		} else {
+			node = tx.visitModuleDeclaration(node.AsModuleDeclaration())
+		}
 	case ast.KindModuleExpression:
 		node = tx.visitModuleExpression(node.AsModuleExpression())
 	case ast.KindClassDeclaration:
@@ -122,6 +130,9 @@ func (tx *RuntimeSyntaxTransformer) visit(node *ast.Node) *ast.Node {
 		} else if ast.IsImportDeclaration(node) && ast.IsIdentifier(node.ModuleSpecifier()) {
 			// `import ... from fragmentName` where fragmentName is a module declaration
 			node = tx.visitModuleFragmentImport(node.AsImportDeclaration())
+		} else if ast.IsExportDeclaration(node) && node.ModuleSpecifier() != nil && ast.IsIdentifier(node.ModuleSpecifier()) {
+			// `export ... from fragmentName` where fragmentName is a module declaration
+			node = tx.visitModuleFragmentExport(node.AsExportDeclaration())
 		} else {
 			node = tx.Visitor().VisitEachChild(node)
 		}
@@ -501,6 +512,237 @@ func (tx *RuntimeSyntaxTransformer) visitModuleExpression(node *ast.ModuleExpres
 	visited := tx.Visitor().VisitEachChild(node.AsNode()).AsModuleExpression()
 	bodyText := tx.printStatementsToText(visited.Body.Statements())
 	return tx.buildModuleFragmentImportExpression(bodyText)
+}
+
+// visitModuleFragment lowers a TC39 module declaration (`module Foo { ... }`) into a dynamic import of a Blob:
+//
+//	const Foo = await import(URL.createObjectURL(new Blob([`...body...`], { type: "application/javascript" })));
+func (tx *RuntimeSyntaxTransformer) visitModuleFragment(node *ast.ModuleDeclaration) *ast.Node {
+	f := tx.Factory()
+
+	// Transform the body so that any nested TypeScript syntax is lowered before it is serialized into the Blob.
+	visited := tx.Visitor().VisitEachChild(node.AsNode()).AsModuleDeclaration()
+	bodyText := tx.printStatementsToText(visited.Body.AsModuleBlock().Statements.Nodes)
+
+	initializer := tx.buildModuleFragmentImportExpression(bodyText)
+
+	var modifiers *ast.ModifierList
+	if node.ModifierFlags()&ast.ModifierFlagsExport != 0 {
+		exportModifier := f.NewModifier(ast.KindExportKeyword)
+		exportModifier.Loc = node.Name().Loc
+		modifiers = f.NewModifierList([]*ast.Node{exportModifier})
+	}
+
+	declaration := f.NewVariableDeclaration(visited.Name(), nil, nil, initializer)
+	declarationList := f.NewVariableDeclarationList(f.NewNodeList([]*ast.Node{declaration}), ast.NodeFlagsConst)
+	statement := f.NewVariableStatement(modifiers, declarationList)
+	tx.EmitContext().SetOriginal(statement, node.AsNode())
+	tx.EmitContext().AssignCommentAndSourceMapRanges(statement, node.AsNode())
+	return statement
+}
+
+// visitModuleFragmentImport lowers `import ... from fragmentName` into a destructuring of the module namespace:
+//
+//	import { a, b as c } from Foo;  ->  const { a, b: c } = Foo;
+//	import * as Foo from Bar;       ->  const Foo = Bar;
+//	import def from Foo;            ->  const { default: def } = Foo;
+func (tx *RuntimeSyntaxTransformer) visitModuleFragmentImport(node *ast.ImportDeclaration) *ast.Node {
+	f := tx.Factory()
+	clause := node.ImportClause
+	if clause == nil {
+		return tx.EmitContext().NewNotEmittedStatement(node.AsNode())
+	}
+	importClause := clause.AsImportClause()
+	if importClause.PhaseModifier == ast.KindTypeKeyword {
+		return tx.EmitContext().NewNotEmittedStatement(node.AsNode())
+	}
+	fragmentName := node.ModuleSpecifier
+
+	declarationStatement := func(bindingName *ast.Node) *ast.Node {
+		declaration := f.NewVariableDeclaration(bindingName, nil, nil, fragmentName)
+		declarationList := f.NewVariableDeclarationList(f.NewNodeList([]*ast.Node{declaration}), ast.NodeFlagsConst)
+		statement := f.NewVariableStatement(nil, declarationList)
+		tx.EmitContext().SetOriginal(statement, node.AsNode())
+		tx.EmitContext().AssignCommentAndSourceMapRanges(statement, node.AsNode())
+		return statement
+	}
+
+	var statements []*ast.Node
+	defaultName := importClause.Name()
+	namedBindings := importClause.NamedBindings
+
+	if namedBindings != nil && namedBindings.Kind == ast.KindNamespaceImport {
+		// import * as ns from Foo;  (the whole namespace object is the fragment value itself)
+		statements = append(statements, declarationStatement(namedBindings.AsNamespaceImport().Name()))
+		if defaultName != nil {
+			// import def, * as ns from Foo;  ->  const { default: def } = Foo;
+			bindingElement := f.NewBindingElement(nil, f.NewIdentifier("default"), defaultName, nil)
+			statements = append(statements, declarationStatement(f.NewBindingPattern(ast.KindObjectBindingPattern, f.NewNodeList([]*ast.Node{bindingElement}))))
+		}
+	} else {
+		bindingElements := []*ast.Node{}
+		if defaultName != nil {
+			// import def from Foo;  ->  const { default: def } = Foo;
+			bindingElements = append(bindingElements, f.NewBindingElement(nil, f.NewIdentifier("default"), defaultName, nil))
+		}
+		if namedBindings != nil && namedBindings.Kind == ast.KindNamedImports {
+			for _, element := range namedBindings.AsNamedImports().Elements.Nodes {
+				specifier := element.AsImportSpecifier()
+				if specifier.IsTypeOnly {
+					continue
+				}
+				var propertyName *ast.Node
+				if specifier.PropertyName != nil {
+					propertyName = specifier.PropertyName
+				}
+				bindingElements = append(bindingElements, f.NewBindingElement(nil, propertyName, specifier.Name(), nil))
+			}
+		}
+		if len(bindingElements) == 0 {
+			return tx.EmitContext().NewNotEmittedStatement(node.AsNode())
+		}
+		statements = append(statements, declarationStatement(f.NewBindingPattern(ast.KindObjectBindingPattern, f.NewNodeList(bindingElements))))
+	}
+
+	if len(statements) == 1 {
+		return statements[0]
+	}
+	return f.NewSyntaxList(statements)
+}
+
+// isModuleFragmentImportOrExport reports whether node is an import or export declaration whose module specifier is a
+// bare identifier referencing a module declaration (rather than a string literal module specifier).
+func isModuleFragmentImportOrExport(node *ast.Node) bool {
+	if node.Kind != ast.KindImportDeclaration && node.Kind != ast.KindExportDeclaration {
+		return false
+	}
+	specifier := node.ModuleSpecifier()
+	return specifier != nil && ast.IsIdentifier(specifier)
+}
+
+// visitModuleFragmentExport lowers `export ... from fragmentName` into a destructuring of the module namespace followed
+// by a local re-export:
+//
+//	export { a, b as c } from Foo;  ->  const { a: _a, b: _b } = Foo; export { _a as a, _b as c };
+//	export * from Foo;              ->  const { x: _x, y: _y } = Foo; export { _x as x, _y as y };
+func (tx *RuntimeSyntaxTransformer) visitModuleFragmentExport(node *ast.ExportDeclaration) *ast.Node {
+	if node.IsTypeOnly {
+		return tx.EmitContext().NewNotEmittedStatement(node.AsNode())
+	}
+	f := tx.Factory()
+	fragmentName := node.ModuleSpecifier
+
+	type reExport struct {
+		// importName is the name of the property on the fragment namespace object.
+		importName string
+		// exportName is the name exported to consumers of the containing module.
+		exportName string
+	}
+	var reExports []reExport
+
+	if node.ExportClause == nil {
+		// `export * from Foo` re-exports every named export (but never `default`). Explicit named re-exports and
+		// names already produced by another `export *` take precedence so that we never emit duplicate exports.
+		explicit := tx.explicitModuleFragmentExportNames()
+		for _, name := range tx.moduleFragmentExportNames(fragmentName) {
+			if name == "default" || explicit[name] || tx.starFragmentReExports[name] {
+				continue
+			}
+			if tx.starFragmentReExports == nil {
+				tx.starFragmentReExports = map[string]bool{}
+			}
+			tx.starFragmentReExports[name] = true
+			reExports = append(reExports, reExport{importName: name, exportName: name})
+		}
+	} else if node.ExportClause.Kind == ast.KindNamedExports {
+		for _, element := range node.ExportClause.AsNamedExports().Elements.Nodes {
+			specifier := element.AsExportSpecifier()
+			if specifier.IsTypeOnly {
+				continue
+			}
+			importName := specifier.Name().Text()
+			if specifier.PropertyName != nil {
+				importName = specifier.PropertyName.Text()
+			}
+			reExports = append(reExports, reExport{importName: importName, exportName: specifier.Name().Text()})
+		}
+	} else {
+		return tx.EmitContext().NewNotEmittedStatement(node.AsNode())
+	}
+
+	if len(reExports) == 0 {
+		return tx.EmitContext().NewNotEmittedStatement(node.AsNode())
+	}
+
+	bindingElements := make([]*ast.Node, 0, len(reExports))
+	exportSpecifiers := make([]*ast.Node, 0, len(reExports))
+	for _, reExport := range reExports {
+		localName := f.NewUniqueName(reExport.exportName)
+		propertyName := f.NewIdentifier(reExport.importName)
+		bindingElements = append(bindingElements, f.NewBindingElement(nil, propertyName, localName, nil))
+		exportSpecifiers = append(exportSpecifiers, f.NewExportSpecifier(false /*isTypeOnly*/, localName, f.NewIdentifier(reExport.exportName)))
+	}
+
+	// const { a: _a, b: _b } = FragmentName;
+	bindingName := f.NewBindingPattern(ast.KindObjectBindingPattern, f.NewNodeList(bindingElements))
+	declaration := f.NewVariableDeclaration(bindingName, nil, nil, fragmentName)
+	declarationList := f.NewVariableDeclarationList(f.NewNodeList([]*ast.Node{declaration}), ast.NodeFlagsConst)
+	statement := f.NewVariableStatement(nil, declarationList)
+
+	// export { _a as a, _b as b };
+	exportDeclaration := f.NewExportDeclaration(nil, false /*isTypeOnly*/, f.NewNamedExports(f.NewNodeList(exportSpecifiers)), nil, nil)
+
+	tx.EmitContext().SetOriginal(statement, node.AsNode())
+	tx.EmitContext().AssignCommentAndSourceMapRanges(statement, node.AsNode())
+	tx.EmitContext().SetOriginal(exportDeclaration, node.AsNode())
+	tx.EmitContext().AssignCommentAndSourceMapRanges(exportDeclaration, node.AsNode())
+	return f.NewSyntaxList([]*ast.Node{statement, exportDeclaration})
+}
+
+// explicitModuleFragmentExportNames returns the set of names explicitly re-exported from a module declaration by a
+// top-level `export { ... } from Fragment` declaration in the current source file.
+func (tx *RuntimeSyntaxTransformer) explicitModuleFragmentExportNames() map[string]bool {
+	if tx.explicitFragmentReExports != nil {
+		return tx.explicitFragmentReExports
+	}
+	result := map[string]bool{}
+	if tx.currentSourceFile != nil {
+		for _, statement := range tx.currentSourceFile.AsSourceFile().Statements.Nodes {
+			if !ast.IsExportDeclaration(statement) || statement.ModuleSpecifier() == nil || !ast.IsIdentifier(statement.ModuleSpecifier()) {
+				continue
+			}
+			exportClause := statement.AsExportDeclaration().ExportClause
+			if exportClause == nil || exportClause.Kind != ast.KindNamedExports {
+				continue
+			}
+			for _, element := range exportClause.AsNamedExports().Elements.Nodes {
+				result[element.AsExportSpecifier().Name().Text()] = true
+			}
+		}
+	}
+	tx.explicitFragmentReExports = result
+	return result
+}
+
+// moduleFragmentExportNames returns the names exported by the module declaration referenced by fragmentName.
+func (tx *RuntimeSyntaxTransformer) moduleFragmentExportNames(fragmentName *ast.Node) []string {
+	if tx.resolver == nil {
+		return nil
+	}
+	declaration := tx.resolver.GetReferencedValueDeclaration(fragmentName)
+	if declaration == nil || !ast.IsModuleDeclaration(declaration) {
+		return nil
+	}
+	symbol := declaration.Symbol()
+	if symbol == nil {
+		return nil
+	}
+	names := make([]string, 0, len(symbol.Exports))
+	for name := range symbol.Exports {
+		names = append(names, name)
+	}
+	slices.Sort(names)
+	return names
 }
 
 // printStatementsToText serializes the already-transformed statements of a module expression body back into

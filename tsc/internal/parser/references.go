@@ -13,9 +13,9 @@ func collectExternalModuleReferences(file *ast.SourceFile) {
 		collectModuleReferences(file, node, false /*inAmbientModule*/)
 	}
 
-	// Imports and exports nested inside a module expression are part of that expression's module body and must
-	// be resolved as well.
-	collectModuleExpressionReferences(file, file.AsNode())
+	// Imports and exports nested inside a module expression or module declaration are part of that inline
+	// module's body and must be resolved as well.
+	collectInlineModuleReferences(file, file.AsNode())
 
 	if file.Flags&ast.NodeFlagsPossiblyContainsDynamicImport != 0 || ast.IsInJSFile(file.AsNode()) {
 		ast.ForEachDynamicImportOrRequireCall(file /*includeTypeSpaceImports*/, true /*requireStringLiteralLikeArgument*/, true, func(node *ast.Node, moduleSpecifier *ast.Expression) bool {
@@ -25,21 +25,25 @@ func collectExternalModuleReferences(file *ast.SourceFile) {
 	}
 }
 
-// collectModuleExpressionReferences walks the entire source file looking for module expressions and collects the
-// external module references from each module expression's body.
-func collectModuleExpressionReferences(file *ast.SourceFile, node *ast.Node) {
+// collectInlineModuleReferences walks the entire source file looking for module expressions and TC39 module
+// declarations and collects the external module references from each inline module's body.
+func collectInlineModuleReferences(file *ast.SourceFile, node *ast.Node) {
 	if node == nil {
 		return
 	}
+	var body *ast.Node
 	if ast.IsModuleExpression(node) {
-		if body := node.AsModuleExpression().Body; body != nil {
-			for _, statement := range body.Statements() {
-				collectModuleReferences(file, statement, false /*inAmbientModule*/)
-			}
+		body = node.AsModuleExpression().Body
+	} else if ast.IsModuleDeclaration(node) && node.Flags&ast.NodeFlagsModuleFragment != 0 {
+		body = node.AsModuleDeclaration().Body
+	}
+	if body != nil && body.Kind == ast.KindModuleBlock {
+		for _, statement := range body.AsModuleBlock().Statements.Nodes {
+			collectModuleReferences(file, statement, false /*inAmbientModule*/)
 		}
 	}
 	node.ForEachChild(func(child *ast.Node) bool {
-		collectModuleExpressionReferences(file, child)
+		collectInlineModuleReferences(file, child)
 		return false
 	})
 }

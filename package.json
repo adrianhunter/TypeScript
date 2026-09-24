@@ -15,6 +15,7 @@
         "build:watch:debug": "hereby build:watch --debug",
         "test": "hereby test",
         "test:module-expressions": "node --test tests/*.test.ts",
+        "test:module-declarations": "node --test tests/module-declarations.test.ts",
         "lint": "hereby lint",
         "format": "hereby format",
         "check:format": "hereby check:format",

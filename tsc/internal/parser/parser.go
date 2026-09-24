@@ -80,6 +80,7 @@ type Parser struct {
 	sourceFlags                 ast.NodeFlags
 	contextFlags                ast.NodeFlags
 	parsingContexts             ParsingContexts
+	inModuleFragment            bool
 	statementHasAwaitIdentifier bool
 	hasDeprecatedTag            bool
 	hasParseError               bool
@@ -2214,7 +2215,12 @@ func (p *Parser) parseModuleDeclaration(pos int, jsdoc jsdocScannerInfo, modifie
 		}
 		isModuleFragment = p.isTopLevelModuleFragment(modifiers)
 	}
+	savedInModuleFragment := p.inModuleFragment
+	if isModuleFragment {
+		p.inModuleFragment = true
+	}
 	result := p.parseModuleOrNamespaceDeclaration(pos, jsdoc, modifiers, false /*nested*/, keyword)
+	p.inModuleFragment = savedInModuleFragment
 	if isModuleFragment {
 		result.Flags |= ast.NodeFlagsModuleFragment
 	}
@@ -2222,8 +2228,9 @@ func (p *Parser) parseModuleDeclaration(pos int, jsdoc jsdocScannerInfo, modifie
 }
 
 // isTopLevelModuleFragment reports whether the current `module Identifier {` prefix denotes a TC39 module
-// declaration (as opposed to a TypeScript namespace). This is only the case for a non-ambient `module` keyword
-// followed by a plain identifier and an immediately following `{`, at the top level of a source file.
+// declaration (as opposed to a TypeScript namespace). This is only the case for a non-ambient `module` keyword,
+// with no line terminator before the identifier, followed by an immediately following `{`, at the top level of a
+// source file or nested within another module declaration.
 func (p *Parser) isTopLevelModuleFragment(modifiers *ast.ModifierList) bool {
 	if p.contextFlags&ast.NodeFlagsAmbient != 0 {
 		return false
@@ -2231,9 +2238,13 @@ func (p *Parser) isTopLevelModuleFragment(modifiers *ast.ModifierList) bool {
 	if modifiers != nil && ast.ModifiersToFlags(modifiers.Nodes)&ast.ModifierFlagsAmbient != 0 {
 		return false
 	}
+	atTopLevel := p.parsingContexts&(1<<PCSourceElements) != 0 &&
+		p.parsingContexts&((1<<PCBlockStatements)|(1<<PCSwitchClauseStatements)) == 0
+	if !atTopLevel && !p.inModuleFragment {
+		return false
+	}
 	return p.token == ast.KindIdentifier &&
-		p.parsingContexts&(1<<PCSourceElements) != 0 &&
-		p.parsingContexts&((1<<PCBlockStatements)|(1<<PCSwitchClauseStatements)) == 0 &&
+		!p.hasPrecedingLineBreak() &&
 		p.lookAhead((*Parser).nextTokenIsOpenBrace)
 }
 
@@ -5684,9 +5695,14 @@ func (p *Parser) parseModuleExpression() *ast.Expression {
 	pos := p.nodePos()
 	jsdoc := p.jsdocScannerInfo()
 	p.parseExpected(ast.KindModuleKeyword)
+	// Statements inside a module expression body live in their own module scope, so `module X { ... }`
+	// declarations nested within them are TC39 module declarations too.
+	savedInModuleFragment := p.inModuleFragment
+	p.inModuleFragment = true
 	body := p.doInContext(ast.NodeFlagsAwaitContext, true, func(p *Parser) *ast.Node {
 		return p.parseModuleBlock()
 	})
+	p.inModuleFragment = savedInModuleFragment
 	result := p.finishNode(p.factory.NewModuleExpression(body), pos)
 	p.withJSDoc(result, jsdoc)
 	return result

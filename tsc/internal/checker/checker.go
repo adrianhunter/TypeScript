@@ -7,7 +7,6 @@ import (
 	"iter"
 	"maps"
 	"math"
-	"os"
 	"slices"
 	"strconv"
 	"strings"
@@ -5488,8 +5487,10 @@ func (c *Checker) checkExternalImportOrExportDeclaration(node *ast.Node) bool {
 		}
 	}
 	inAmbientExternalModule := ast.IsModuleBlock(node.Parent) && ast.IsAmbientModule(node.Parent.Parent)
-	inModuleExpression := ast.IsModuleBlock(node.Parent) && ast.IsModuleExpression(node.Parent.Parent)
-	if !ast.IsSourceFile(node.Parent) && !inAmbientExternalModule && !inModuleExpression {
+	inInlineModule := ast.IsModuleBlock(node.Parent) &&
+		(ast.IsModuleExpression(node.Parent.Parent) ||
+			ast.IsModuleDeclaration(node.Parent.Parent) && node.Parent.Parent.Flags&ast.NodeFlagsModuleFragment != 0)
+	if !ast.IsSourceFile(node.Parent) && !inAmbientExternalModule && !inInlineModule {
 		c.error(moduleName, core.IfElse(ast.IsExportDeclaration(node), diagnostics.Export_declarations_are_not_permitted_in_a_namespace, diagnostics.Import_declarations_in_a_namespace_cannot_reference_a_module))
 		return false
 	}
@@ -5756,7 +5757,7 @@ func isContainedByNamespace(node *ast.Node) bool {
 	if !ast.IsSourceFile(container) {
 		container = container.Parent
 	}
-	return ast.IsModuleDeclaration(container) && !ast.IsAmbientModule(container)
+	return ast.IsModuleDeclaration(container) && !ast.IsAmbientModule(container) && container.Flags&ast.NodeFlagsModuleFragment == 0
 }
 
 func (c *Checker) checkExportAssignment(node *ast.Node) {
