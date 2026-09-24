@@ -4,6 +4,7 @@ package tstransforms
 
 import (
 	"slices"
+	"strings"
 
 	"github.com/microsoft/TypeScript/tsc/internal/ast"
 	"github.com/microsoft/TypeScript/tsc/internal/binder"
@@ -83,7 +84,9 @@ func (tx *RuntimeSyntaxTransformer) visit(node *ast.Node) *ast.Node {
 	savedCurrentScope, savedCurrentScopeFirstDeclarationsOfName := tx.pushScope(node)
 	defer tx.popScope(savedCurrentScope, savedCurrentScopeFirstDeclarationsOfName)
 
-	if node.SubtreeFacts()&ast.SubtreeContainsTypeScript == 0 && (tx.currentNamespace == nil && tx.currentEnum == nil || node.SubtreeFacts()&ast.SubtreeContainsIdentifier == 0) {
+	isModuleFragmentImport := ast.IsImportDeclaration(node) && ast.IsIdentifier(node.ModuleSpecifier())
+
+	if node.SubtreeFacts()&ast.SubtreeContainsTypeScript == 0 && !isModuleFragmentImport && (tx.currentNamespace == nil && tx.currentEnum == nil || node.SubtreeFacts()&ast.SubtreeContainsIdentifier == 0) {
 		return node
 	}
 
@@ -98,7 +101,11 @@ func (tx *RuntimeSyntaxTransformer) visit(node *ast.Node) *ast.Node {
 	case ast.KindEnumDeclaration:
 		node = tx.visitEnumDeclaration(node.AsEnumDeclaration())
 	case ast.KindModuleDeclaration:
-		node = tx.visitModuleDeclaration(node.AsModuleDeclaration())
+		if node.Flags&ast.NodeFlagsModuleFragment != 0 {
+			node = tx.visitModuleFragment(node.AsModuleDeclaration())
+		} else {
+			node = tx.visitModuleDeclaration(node.AsModuleDeclaration())
+		}
 	case ast.KindClassDeclaration:
 		node = tx.visitClassDeclaration(node.AsClassDeclaration())
 	case ast.KindClassExpression:
@@ -113,6 +120,9 @@ func (tx *RuntimeSyntaxTransformer) visit(node *ast.Node) *ast.Node {
 		if tx.currentNamespace != nil && tx.currentScope != nil && tx.currentScope.Kind != ast.KindBlock {
 			// do not emit ES6 imports and exports since they are illegal inside a namespace
 			node = nil
+		} else if ast.IsImportDeclaration(node) && ast.IsIdentifier(node.ModuleSpecifier()) {
+			// `import ... from fragmentName` where fragmentName is a module declaration
+			node = tx.visitModuleFragmentImport(node.AsImportDeclaration())
 		} else {
 			node = tx.Visitor().VisitEachChild(node)
 		}
@@ -482,6 +492,134 @@ func (tx *RuntimeSyntaxTransformer) visitModuleDeclaration(node *ast.ModuleDecla
 	tx.EmitContext().AssignCommentAndSourceMapRanges(moduleStatement, node.AsNode())
 	tx.EmitContext().AddEmitFlags(moduleStatement, emitFlags)
 	return tx.Factory().NewSyntaxList(append(statements, moduleStatement))
+}
+
+// visitModuleFragment lowers a TC39 module declaration (`module Foo { ... }`) into a dynamic import of a Blob:
+//
+//	const Foo = await import(URL.createObjectURL(new Blob([`...body...`], { type: "application/javascript" })));
+func (tx *RuntimeSyntaxTransformer) visitModuleFragment(node *ast.ModuleDeclaration) *ast.Node {
+	f := tx.Factory()
+
+	// Transform the body so that any nested TypeScript syntax is lowered before it is serialized into the Blob.
+	visited := tx.Visitor().VisitEachChild(node.AsNode()).AsModuleDeclaration()
+	bodyText := tx.printStatementsToText(visited.Body.AsModuleBlock().Statements.Nodes)
+
+	initializer := tx.buildModuleFragmentImportExpression(bodyText)
+
+	var modifiers *ast.ModifierList
+	if node.ModifierFlags()&ast.ModifierFlagsExport != 0 {
+		exportModifier := f.NewModifier(ast.KindExportKeyword)
+		exportModifier.Loc = node.Name().Loc
+		modifiers = f.NewModifierList([]*ast.Node{exportModifier})
+	}
+
+	declaration := f.NewVariableDeclaration(visited.Name(), nil, nil, initializer)
+	declarationList := f.NewVariableDeclarationList(f.NewNodeList([]*ast.Node{declaration}), ast.NodeFlagsConst)
+	statement := f.NewVariableStatement(modifiers, declarationList)
+	tx.EmitContext().SetOriginal(statement, node.AsNode())
+	tx.EmitContext().AssignCommentAndSourceMapRanges(statement, node.AsNode())
+	return statement
+}
+
+// visitModuleFragmentImport lowers `import ... from fragmentName` into a destructuring of the module namespace:
+//
+//	import { a, b as c } from Foo;  ->  const { a, b: c } = Foo;
+//	import * as Foo from Bar;       ->  const Foo = Bar;
+//	import def from Foo;            ->  const { default: def } = Foo;
+func (tx *RuntimeSyntaxTransformer) visitModuleFragmentImport(node *ast.ImportDeclaration) *ast.Node {
+	f := tx.Factory()
+	clause := node.ImportClause
+	if clause == nil {
+		return tx.EmitContext().NewNotEmittedStatement(node.AsNode())
+	}
+	importClause := clause.AsImportClause()
+	if importClause.PhaseModifier == ast.KindTypeKeyword {
+		return tx.EmitContext().NewNotEmittedStatement(node.AsNode())
+	}
+	fragmentName := node.ModuleSpecifier
+
+	declarationList := func(bindingName *ast.Node) *ast.Node {
+		declaration := f.NewVariableDeclaration(bindingName, nil, nil, fragmentName)
+		return f.NewVariableDeclarationList(f.NewNodeList([]*ast.Node{declaration}), ast.NodeFlagsConst)
+	}
+
+	var bindingName *ast.Node
+	if importClause.Name() != nil && importClause.NamedBindings == nil {
+		// default import: const { default: def } = Foo;
+		bindingElement := f.NewBindingElement(nil, f.NewIdentifier("default"), importClause.Name(), nil)
+		bindingName = f.NewBindingPattern(ast.KindObjectBindingPattern, f.NewNodeList([]*ast.Node{bindingElement}))
+	} else if importClause.NamedBindings != nil {
+		switch importClause.NamedBindings.Kind {
+		case ast.KindNamespaceImport:
+			bindingName = importClause.NamedBindings.AsNamespaceImport().Name()
+		case ast.KindNamedImports:
+			namedImports := importClause.NamedBindings.AsNamedImports()
+			bindingElements := make([]*ast.Node, 0, len(namedImports.Elements.Nodes))
+			for _, element := range namedImports.Elements.Nodes {
+				specifier := element.AsImportSpecifier()
+				var propertyName *ast.Node
+				if specifier.PropertyName != nil {
+					propertyName = specifier.PropertyName
+				}
+				bindingElements = append(bindingElements, f.NewBindingElement(nil, propertyName, specifier.Name(), nil))
+			}
+			bindingName = f.NewBindingPattern(ast.KindObjectBindingPattern, f.NewNodeList(bindingElements))
+		}
+	}
+	if bindingName == nil {
+		return tx.EmitContext().NewNotEmittedStatement(node.AsNode())
+	}
+
+	statement := f.NewVariableStatement(nil, declarationList(bindingName))
+	tx.EmitContext().SetOriginal(statement, node.AsNode())
+	tx.EmitContext().AssignCommentAndSourceMapRanges(statement, node.AsNode())
+	return statement
+}
+
+// printStatementsToText serializes the already-transformed statements of a module fragment body back into JavaScript
+// source text that can be embedded inside a Blob.
+func (tx *RuntimeSyntaxTransformer) printStatementsToText(statements []*ast.Statement) string {
+	if len(statements) == 0 {
+		return ""
+	}
+	var sourceFile *ast.SourceFile
+	if tx.currentSourceFile != nil {
+		sourceFile = tx.currentSourceFile.AsSourceFile()
+	}
+	newLine := tx.compilerOptions.NewLine.GetNewLineCharacter()
+	var sb strings.Builder
+	for i, statement := range statements {
+		text, _ := printer.PrintAndPositionNode(&tx.Factory().NodeFactory, statement, sourceFile, newLine, 4 /*indentSize*/, tx.EmitContext())
+		if i > 0 {
+			sb.WriteString(newLine)
+		}
+		sb.WriteString(text)
+	}
+	return sb.String()
+}
+
+// buildModuleFragmentImportExpression builds:
+//
+//	await import(URL.createObjectURL(new Blob([`bodyText`], { type: "application/javascript" })))
+func (tx *RuntimeSyntaxTransformer) buildModuleFragmentImportExpression(bodyText string) *ast.Expression {
+	f := tx.Factory()
+
+	template := f.NewNoSubstitutionTemplateLiteral(bodyText, ast.TokenFlagsNone)
+
+	elements := f.NewNodeList([]*ast.Node{template})
+	arrayLiteral := f.NewArrayLiteralExpression(elements, true /*multiLine*/)
+
+	typeProperty := f.NewPropertyAssignment(nil, f.NewIdentifier("type"), nil, nil, f.NewStringLiteral("application/javascript", ast.TokenFlagsNone))
+	optionsObject := f.NewObjectLiteralExpression(f.NewNodeList([]*ast.Node{typeProperty}), false /*multiLine*/)
+
+	newExpression := f.NewNewExpression(f.NewIdentifier("Blob"), nil, f.NewNodeList([]*ast.Node{arrayLiteral, optionsObject}))
+
+	createObjectURL := f.NewPropertyAccessExpression(f.NewIdentifier("URL"), nil, f.NewIdentifier("createObjectURL"), ast.NodeFlagsNone)
+	createObjectURLCall := f.NewCallExpression(createObjectURL, nil, nil, f.NewNodeList([]*ast.Node{newExpression}), ast.NodeFlagsNone)
+
+	importCall := f.NewCallExpression(f.NewKeywordExpression(ast.KindImportKeyword), nil, nil, f.NewNodeList([]*ast.Node{createObjectURLCall}), ast.NodeFlagsNone)
+
+	return f.NewAwaitExpression(importCall)
 }
 
 func (tx *RuntimeSyntaxTransformer) transformModuleBody(node *ast.ModuleDeclaration, namespaceLocalName *ast.IdentifierNode) *ast.BlockNode {
