@@ -7,6 +7,7 @@ import (
 	"iter"
 	"maps"
 	"math"
+	"os"
 	"slices"
 	"strconv"
 	"strings"
@@ -5261,7 +5262,7 @@ func (c *Checker) checkModuleDeclaration(node *ast.Node) {
 	}
 	if ast.IsIdentifier(node.Name()) {
 		c.checkCollisionsForDeclarationName(node, node.Name())
-		if node.AsModuleDeclaration().Keyword == ast.KindModuleKeyword {
+		if node.AsModuleDeclaration().Keyword == ast.KindModuleKeyword && node.Flags&ast.NodeFlagsModuleFragment == 0 {
 			c.error(node.Name(), diagnostics.A_namespace_declaration_should_not_be_declared_using_the_module_keyword_Please_use_the_namespace_keyword_instead)
 		}
 	}
@@ -5481,8 +5482,10 @@ func (c *Checker) checkExternalImportOrExportDeclaration(node *ast.Node) bool {
 		return false
 	}
 	if !ast.IsStringLiteral(moduleName) {
-		c.error(moduleName, diagnostics.String_literal_expected)
-		return false
+		if c.resolveModuleFragmentImport(moduleName) == nil {
+			c.error(moduleName, diagnostics.String_literal_expected)
+			return false
+		}
 	}
 	inAmbientExternalModule := ast.IsModuleBlock(node.Parent) && ast.IsAmbientModule(node.Parent.Parent)
 	inModuleExpression := ast.IsModuleBlock(node.Parent) && ast.IsModuleExpression(node.Parent.Parent)
@@ -15376,6 +15379,29 @@ func (c *Checker) getCannotResolveModuleNameErrorForSpecificModule(moduleName *a
 func (c *Checker) resolveExternalModuleNameWorker(location *ast.Node, moduleReferenceExpression *ast.Node, moduleNotFoundError *diagnostics.Message, ignoreErrors bool, isForAugmentation bool, importAttributesType *Type) *ast.Symbol {
 	if ast.IsStringLiteralLike(moduleReferenceExpression) {
 		return c.resolveExternalModule(location, moduleReferenceExpression.Text(), moduleNotFoundError, core.IfElse(!ignoreErrors, moduleReferenceExpression, nil), isForAugmentation, importAttributesType)
+	}
+	if symbol := c.resolveModuleFragmentImport(moduleReferenceExpression); symbol != nil {
+		return symbol
+	}
+	return nil
+}
+
+// resolveModuleFragmentImport resolves a bare identifier used as a module specifier to a TC39 module declaration
+// (i.e. `import { x } from fragmentName;`). It returns nil if the identifier does not reference a module declaration.
+func (c *Checker) resolveModuleFragmentImport(moduleReferenceExpression *ast.Node) *ast.Symbol {
+	if !ast.IsIdentifier(moduleReferenceExpression) {
+		return nil
+	}
+	symbol := c.resolveName(moduleReferenceExpression, moduleReferenceExpression.Text(), ast.SymbolFlagsValue|ast.SymbolFlagsExportValue, nil /*nameNotFoundMessage*/, false /*isUse*/, false /*excludeGlobals*/)
+	if symbol == nil {
+		return nil
+	}
+	for _, declaration := range symbol.Declarations {
+		if ast.IsModuleDeclaration(declaration) && declaration.Flags&ast.NodeFlagsModuleFragment != 0 {
+			if moduleSymbol := c.getSymbolOfDeclaration(declaration); moduleSymbol != nil {
+				return moduleSymbol
+			}
+		}
 	}
 	return nil
 }

@@ -2201,6 +2201,7 @@ func (p *Parser) parseEnumDeclaration(pos int, jsdoc jsdocScannerInfo, modifiers
 
 func (p *Parser) parseModuleDeclaration(pos int, jsdoc jsdocScannerInfo, modifiers *ast.ModifierList) *ast.Statement {
 	keyword := ast.KindModuleKeyword
+	isModuleFragment := false
 	if p.token == ast.KindGlobalKeyword {
 		// global augmentation
 		return p.parseAmbientExternalModuleDeclaration(pos, jsdoc, modifiers)
@@ -2211,8 +2212,29 @@ func (p *Parser) parseModuleDeclaration(pos int, jsdoc jsdocScannerInfo, modifie
 		if p.token == ast.KindStringLiteral {
 			return p.parseAmbientExternalModuleDeclaration(pos, jsdoc, modifiers)
 		}
+		isModuleFragment = p.isTopLevelModuleFragment(modifiers)
 	}
-	return p.parseModuleOrNamespaceDeclaration(pos, jsdoc, modifiers, false /*nested*/, keyword)
+	result := p.parseModuleOrNamespaceDeclaration(pos, jsdoc, modifiers, false /*nested*/, keyword)
+	if isModuleFragment {
+		result.Flags |= ast.NodeFlagsModuleFragment
+	}
+	return result
+}
+
+// isTopLevelModuleFragment reports whether the current `module Identifier {` prefix denotes a TC39 module
+// declaration (as opposed to a TypeScript namespace). This is only the case for a non-ambient `module` keyword
+// followed by a plain identifier and an immediately following `{`, at the top level of a source file.
+func (p *Parser) isTopLevelModuleFragment(modifiers *ast.ModifierList) bool {
+	if p.contextFlags&ast.NodeFlagsAmbient != 0 {
+		return false
+	}
+	if modifiers != nil && ast.ModifiersToFlags(modifiers.Nodes)&ast.ModifierFlagsAmbient != 0 {
+		return false
+	}
+	return p.token == ast.KindIdentifier &&
+		p.parsingContexts&(1<<PCSourceElements) != 0 &&
+		p.parsingContexts&((1<<PCBlockStatements)|(1<<PCSwitchClauseStatements)) == 0 &&
+		p.lookAhead((*Parser).nextTokenIsOpenBrace)
 }
 
 func (p *Parser) parseAmbientExternalModuleDeclaration(pos int, jsdoc jsdocScannerInfo, modifiers *ast.ModifierList) *ast.Node {

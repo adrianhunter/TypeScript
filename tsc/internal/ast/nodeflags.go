@@ -70,4 +70,5 @@ const (
 
 	// The following flag repurposes other NodeFlags for ModuleDeclaration nodes
 	NodeFlagsNestedNamespace NodeFlags = NodeFlagsOptionalChain // If ModuleDeclaration is a nested namespace (e.g. inner part of A.B.C)
+	NodeFlagsModuleFragment   NodeFlags = 1 << 29                 // If ModuleDeclaration is a TC39 module declaration (inline module, i.e. `module Foo { ... }`)
 )

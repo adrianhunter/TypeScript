@@ -5,6 +5,7 @@ package tstransforms
 import (
 	"slices"
 	"strings"
+	"strings"
 
 	"github.com/microsoft/TypeScript/tsc/internal/ast"
 	"github.com/microsoft/TypeScript/tsc/internal/binder"
@@ -84,7 +85,9 @@ func (tx *RuntimeSyntaxTransformer) visit(node *ast.Node) *ast.Node {
 	savedCurrentScope, savedCurrentScopeFirstDeclarationsOfName := tx.pushScope(node)
 	defer tx.popScope(savedCurrentScope, savedCurrentScopeFirstDeclarationsOfName)
 
-	if node.SubtreeFacts()&ast.SubtreeContainsTypeScript == 0 && (tx.currentNamespace == nil && tx.currentEnum == nil || node.SubtreeFacts()&ast.SubtreeContainsIdentifier == 0) {
+	isModuleFragmentImport := ast.IsImportDeclaration(node) && ast.IsIdentifier(node.ModuleSpecifier())
+
+	if node.SubtreeFacts()&ast.SubtreeContainsTypeScript == 0 && !isModuleFragmentImport && (tx.currentNamespace == nil && tx.currentEnum == nil || node.SubtreeFacts()&ast.SubtreeContainsIdentifier == 0) {
 		return node
 	}
 
@@ -116,6 +119,9 @@ func (tx *RuntimeSyntaxTransformer) visit(node *ast.Node) *ast.Node {
 		if tx.currentNamespace != nil && tx.currentScope != nil && tx.currentScope.Kind != ast.KindBlock {
 			// do not emit ES6 imports and exports since they are illegal inside a namespace
 			node = nil
+		} else if ast.IsImportDeclaration(node) && ast.IsIdentifier(node.ModuleSpecifier()) {
+			// `import ... from fragmentName` where fragmentName is a module declaration
+			node = tx.visitModuleFragmentImport(node.AsImportDeclaration())
 		} else {
 			node = tx.Visitor().VisitEachChild(node)
 		}
