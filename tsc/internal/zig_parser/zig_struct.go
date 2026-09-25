@@ -151,6 +151,8 @@ func (p *Parser) parseZigLiteralElement() *ast.Node {
 				// token preceding the member name and offers the container's fields. The formatting
 				// parse keeps token-accurate ranges instead.
 				name.Loc = core.NewTextRange(dotStart, name.End())
+				// The range now starts at the dot; print the bare field name.
+				name.Flags |= ast.NodeFlagsSynthesized
 				start = dotStart
 			}
 			p.nextToken() // '='
@@ -179,6 +181,7 @@ func (p *Parser) parseZigLiteralElement() *ast.Node {
 				// Extend the name over the leading dot so `.name` reads as a single member token and
 				// completion triggers right after the dot.
 				name.Loc = core.NewTextRange(dotStart, name.End())
+				name.Flags |= ast.NodeFlagsSynthesized
 			} else {
 				name = p.newIdentifierAt("", core.NewTextRange(dotStart, dotEnd))
 			}

@@ -238,7 +238,7 @@ func (p *Printer) getTextOfNode(node *ast.Node, includeTrivia bool) string {
 		}
 	}
 
-	canUseSourceFile := p.currentSourceFile != nil && node.Parent != nil && !ast.NodeIsSynthesized(node)
+	canUseSourceFile := p.currentSourceFile != nil && node.Parent != nil && !ast.NodeIsSynthesized(node) && node.Flags&ast.NodeFlagsSynthesized == 0
 
 	switch node.Kind {
 	case ast.KindIdentifier,

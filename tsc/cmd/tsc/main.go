@@ -24,6 +24,8 @@ func runMain() int {
 			return runLSP(args[1:])
 		case "--api":
 			return runAPI(args[1:])
+		case "--zig-debug":
+			return runZigDebug(args[1:])
 		}
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)

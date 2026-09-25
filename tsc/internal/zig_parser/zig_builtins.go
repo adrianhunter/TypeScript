@@ -86,6 +86,8 @@ func zigBuiltinGlobalName(name string) string {
 // zigBuiltinCall builds `name(args...)` with a synthesized callee at the builtin's position.
 func (p *Parser) zigBuiltinCall(name string, args []*ast.Node, pos int) *ast.Expression {
 	callee := p.newIdentifierAt(name, core.NewTextRange(pos, pos+1+len(name)))
+	// The range points at the `@builtin` text; print the (dotless) name instead.
+	callee.Flags |= ast.NodeFlagsSynthesized
 	argList := p.newNodeList(core.NewTextRange(pos, p.nodePos()), args)
 	return p.finishNode(p.factory.NewCallExpression(callee, nil, nil, argList, ast.NodeFlagsNone), pos)
 }

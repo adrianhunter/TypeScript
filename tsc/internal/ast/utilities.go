@@ -74,7 +74,7 @@ func NodeIsPresent(node *Node) bool {
 
 // Determines if a node contains synthetic positions
 func NodeIsSynthesized(node *Node) bool {
-	return PositionIsSynthesized(node.Loc.Pos()) || PositionIsSynthesized(node.Loc.End())
+	return node == nil || PositionIsSynthesized(node.Loc.Pos()) || PositionIsSynthesized(node.Loc.End())
 }
 
 func RangeIsSynthesized(loc core.TextRange) bool {

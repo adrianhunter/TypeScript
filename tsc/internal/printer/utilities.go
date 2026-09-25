@@ -612,7 +612,7 @@ func greatestEnd(end int, nodes ...interface{ End() int }) int {
 }
 
 func skipSynthesizedParentheses(node *ast.Node) *ast.Node {
-	for node.Kind == ast.KindParenthesizedExpression && ast.NodeIsSynthesized(node) {
+	for node != nil && node.Kind == ast.KindParenthesizedExpression && ast.NodeIsSynthesized(node) {
 		node = node.Expression()
 	}
 	return node
