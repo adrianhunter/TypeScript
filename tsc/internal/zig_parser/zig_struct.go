@@ -21,6 +21,12 @@ func (p *Parser) parseZigDotExpression() *ast.Expression {
 		return p.parseZigContainerLiteral(pos)
 	}
 	name := p.parseIdentifierName()
+	if p.opts.SkipZigDesugar {
+		// Formatting parse: keep the `.name` literal's source range so spacing is preserved.
+		result := p.newIdentifierLike(name)
+		result.Loc = core.NewTextRange(pos, p.nodePos())
+		return result
+	}
 	// `.name` is an enum literal. When the surrounding declaration has a known type, qualify it so a
 	// real (synthesized) enum resolves; otherwise fall back to a string literal.
 	if p.zigContextualType != nil && p.zigContextualType.Kind == ast.KindTypeReference {
@@ -131,8 +137,15 @@ func (p *Parser) parseZigContainerMember() *ast.Node {
 	default:
 		member = p.parseStatement()
 	}
-	// Real Zig separates container members with commas; also accept a semicolon for the dialect.
-	p.parseOptional(ast.KindCommaToken)
+	// Real Zig separates fields with commas and declarations with semicolons; accept either. Include
+	// the separator in the member's range so formatters and linters see the real statement end.
+	if p.token == ast.KindCommaToken || p.token == ast.KindSemicolonToken {
+		end := p.scanner.TokenEnd()
+		p.nextToken()
+		if member != nil {
+			member = p.finishNodeWithEnd(member, member.Pos(), end)
+		}
+	}
 	return member
 }
 

@@ -2443,7 +2443,7 @@ func (p *Parser) parseModuleBlock() *ast.Node {
 			parseElement = (*Parser).parseZigContainerMember
 		}
 		statements = p.parseList(PCBlockStatements, parseElement)
-		if len(p.zigStructExprs) != 0 || len(p.zigEnumExprs) != 0 || len(p.zigImportExprs) != 0 {
+		if !p.opts.SkipZigDesugar && (len(p.zigStructExprs) != 0 || len(p.zigEnumExprs) != 0 || len(p.zigImportExprs) != 0) {
 			statements.Nodes = p.desugarZigStructs(statements.Nodes)
 		}
 		p.parseExpected(ast.KindCloseBraceToken)

@@ -20,9 +20,19 @@ func (p *Parser) parseZigBuiltinExpression() *ast.Expression {
 		name = p.scanner.TokenValue()
 		p.nextToken()
 	}
-	var args []*ast.Node
+	var argsList *ast.NodeList
 	if p.token == ast.KindOpenParenToken {
-		args = p.parseArgumentList().Nodes
+		argsList = p.parseArgumentList()
+	}
+	if p.opts.SkipZigDesugar {
+		// Formatting parse: keep the builtin call source-faithful so the formatter does not add
+		// spaces or move text around a synthesized expression.
+		callee := p.newIdentifierAt("@"+name, core.NewTextRange(pos, pos+1+len(name)))
+		return p.finishNode(p.factory.NewCallExpression(callee, nil, nil, argsList, ast.NodeFlagsNone), pos)
+	}
+	var args []*ast.Node
+	if argsList != nil {
+		args = argsList.Nodes
 	}
 
 	switch name {

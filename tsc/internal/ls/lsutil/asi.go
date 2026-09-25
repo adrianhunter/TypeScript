@@ -1,10 +1,42 @@
 package lsutil
 
 import (
+	"strings"
+
 	"github.com/microsoft/TypeScript/tsc/internal/ast"
 	"github.com/microsoft/TypeScript/tsc/internal/astnav"
 	"github.com/microsoft/TypeScript/tsc/internal/scanner"
 )
+
+// isZigContainerField reports whether node is a field of a Zig container body (`struct { ... }` /
+// `union { ... }`). Zig fields are separated by commas, so the TypeScript formatter must not insert
+// a semicolon after them. Zig declarations inside a container (`const`/`var`/`fn`) still use `;`.
+func isZigContainerField(node *ast.Node, file *ast.SourceFile) bool {
+	if node.Kind != ast.KindPropertyDeclaration {
+		return false
+	}
+	text := file.Text()
+	for body := node.Parent; body != nil; body = body.Parent {
+		if body.Kind != ast.KindModuleBlock {
+			continue
+		}
+		container := body.Parent
+		if container == nil || (container.Kind != ast.KindModuleExpression && container.Kind != ast.KindModuleDeclaration) {
+			continue
+		}
+		start, end := container.Pos(), body.Pos()
+		if start < 0 || end > len(text) || start >= end {
+			continue
+		}
+		header := strings.TrimSpace(text[start:end])
+		for _, keyword := range []string{"struct", "union", "opaque", "packed", "extern"} {
+			if strings.HasPrefix(header, keyword) {
+				return true
+			}
+		}
+	}
+	return false
+}
 
 func PositionIsASICandidate(pos int, context *ast.Node, file *ast.SourceFile) bool {
 	contextAncestor := ast.FindAncestorOrQuit(context, func(ancestor *ast.Node) ast.FindAncestorResult {
@@ -64,6 +96,9 @@ func SyntaxRequiresTrailingSemicolonOrASI(kind ast.Kind) bool {
 }
 
 func NodeIsASICandidate(node *ast.Node, file *ast.SourceFile) bool {
+	if isZigContainerField(node, file) {
+		return false
+	}
 	lastToken := GetLastToken(node, file)
 	if lastToken != nil && lastToken.Kind == ast.KindSemicolonToken {
 		return false
