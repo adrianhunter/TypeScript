@@ -135,7 +135,10 @@ func (p *Parser) parseZigLiteralElement() *ast.Node {
 			} else {
 				name = p.newIdentifierAt("", core.NewTextRange(dotStart, dotEnd))
 			}
-			return p.finishNode(p.factory.NewPropertyAssignment(nil, name, nil, nil, nil), dotStart)
+			// A PropertyAssignment must have an initializer; use a missing expression so checking the
+			// incomplete literal yields an error type instead of dereferencing nil.
+			initializer := p.newIdentifierAt("", core.NewTextRange(name.End(), name.End()))
+			return p.finishNode(p.factory.NewPropertyAssignment(nil, name, nil, nil, initializer), dotStart)
 		}
 	}
 	return p.parseAssignmentExpressionOrHigher()

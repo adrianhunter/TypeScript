@@ -2437,6 +2437,30 @@ func (l *LanguageService) createCompletionItem(
 		// Otherwise use the completion list default.
 	}
 
+	// Zig struct literals spell field initializers as `.field = value`; give the completion an
+	// explicit edit so the client inserts that instead of the TS-style `field: value`.
+	if strings.HasSuffix(file.FileName(), ".zig") && data.completionKind == CompletionKindObjectPropertyDeclaration {
+		if data.location != nil && ast.IsIdentifier(data.location) &&
+			data.location.Parent != nil && ast.IsPropertyAssignment(data.location.Parent) {
+			nameNode := data.location
+			initializer := data.location.Parent.AsPropertyAssignment().Initializer
+			hasExistingValue := initializer != nil && initializer.Pos() != initializer.End()
+			if lspRange, fidelity := l.createLspRangeFromBounds(nameNode.Pos(), nameNode.End(), file); fidelity.IsExact() {
+				replacementSpan = &lspRange
+				filterText = "." + name
+				if hasExistingValue {
+					insertText = "." + name
+				} else {
+					insertText = "." + name + " = "
+				}
+			}
+		} else {
+			// No `.field` typed yet: insert the whole initializer at the cursor.
+			filterText = "." + name
+			insertText = "." + name + " = "
+		}
+	}
+
 	preselect := isRecommendedCompletionMatch(symbol, data.recommendedCompletion, typeChecker)
 	kindModifiers := lsutil.GetSymbolModifiers(typeChecker, symbol)
 
