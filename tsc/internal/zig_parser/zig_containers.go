@@ -317,28 +317,29 @@ func (p *Parser) zigParseContainerBinding(pos int, exported bool) []*ast.Node {
 	if valueType == nil {
 		valueType = p.zigUnknownTypeAt(pos)
 	}
-	decl := p.finishNode(p.factory.NewVariableDeclaration(
+	end := name.End()
+	decl := p.finishNodeWithEnd(p.factory.NewVariableDeclaration(
 		p.newIdentifierLike(name), nil, valueType, p.zigUnknownValueOfType(valueType, pos),
-	), pos)
+	), pos, end)
 	flags := ast.NodeFlagsLet
 	if isConst {
 		flags = ast.NodeFlagsConst
 	}
-	declList := p.finishNode(p.factory.NewVariableDeclarationList(
-		p.newNodeList(core.NewTextRange(pos, p.nodePos()), []*ast.Node{decl}), flags,
-	), pos)
-	valueStatement := p.finishNode(p.factory.NewVariableStatement(
+	declList := p.finishNodeWithEnd(p.factory.NewVariableDeclarationList(
+		p.newNodeList(core.NewTextRange(pos, end), []*ast.Node{decl}), flags,
+	), pos, end)
+	valueStatement := p.finishNodeWithEnd(p.factory.NewVariableStatement(
 		p.zigExportModifiers(exported, pos), declList,
-	), pos)
+	), pos, end)
 	if declaredType != nil {
 		return []*ast.Node{valueStatement}
 	}
-	typeAlias := p.finishNode(p.factory.NewTypeAliasDeclaration(
+	typeAlias := p.finishNodeWithEnd(p.factory.NewTypeAliasDeclaration(
 		p.zigExportModifiers(exported, pos),
 		p.newIdentifierAt(zigTypeAliasName(name.Text()), name.Loc),
 		nil,
 		p.zigUnknownTypeAt(pos),
-	), pos)
+	), pos, name.End())
 	return []*ast.Node{typeAlias, valueStatement}
 }
 

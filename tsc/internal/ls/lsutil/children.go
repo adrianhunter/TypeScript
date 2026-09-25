@@ -16,10 +16,15 @@ func GetLastChild(node *ast.Node, sourceFile *ast.SourceFile) *ast.Node {
 		return nil
 	}
 	var tokenStartPos int
-	if lastChildNode != nil {
+	if lastChildNode != nil && lastChildNode.End() >= 0 {
 		tokenStartPos = lastChildNode.End()
 	} else {
+		// Synthesized children (e.g. lowered Zig imports) can carry a `-1` location. Fall back to
+		// the node start rather than scanning from a negative position.
 		tokenStartPos = node.Pos()
+	}
+	if tokenStartPos < 0 {
+		tokenStartPos = 0
 	}
 	var lastToken *ast.Node
 	scanner := scanner.GetScannerForSourceFile(sourceFile, tokenStartPos)

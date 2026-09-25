@@ -88,7 +88,13 @@ func (p *Parser) parseZigContainerLiteral(pos int) *ast.Expression {
 	}
 	if p.zigContextualType != nil {
 		typeNode := p.factory.DeepCloneReparse(p.zigContextualType)
-		return p.finishNode(p.factory.NewAsExpression(result, typeNode), pos)
+		// The contextual type may start before the literal (e.g. the `Foo` in `Foo{}`), so extend the
+		// assertion's start to contain it and keep node ranges well formed for the language service.
+		start := pos
+		if typeNode.Pos() < start {
+			start = typeNode.Pos()
+		}
+		return p.finishNode(p.factory.NewAsExpression(result, typeNode), start)
 	}
 	return result
 }

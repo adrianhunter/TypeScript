@@ -3,6 +3,7 @@ package astnav
 import (
 	"fmt"
 	"slices"
+	"strings"
 
 	"github.com/microsoft/TypeScript/tsc/internal/ast"
 	"github.com/microsoft/TypeScript/tsc/internal/core"
@@ -250,6 +251,12 @@ func getTokenAtPosition(
 					if token == ast.KindIdentifier || !ast.IsTokenKind(token) {
 						if ast.IsJSDocKind(current.Kind) {
 							return current
+						}
+						if strings.HasSuffix(sourceFile.FileName(), ".zig") {
+							// The permissive Zig front-end synthesizes declarations whose ranges can
+							// cover source text they do not model. Return the scanned token instead of
+							// asserting, so language features keep working.
+							return sourceFile.GetOrCreateToken(token, tokenFullStart, tokenEnd, current, flags)
 						}
 						panic(fmt.Sprintf("did not expect %s to have %s in its trivia", current.Kind.String(), token.String()))
 					}

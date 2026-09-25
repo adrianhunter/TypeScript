@@ -120,7 +120,16 @@ func GetTextOfJSDocComment(comment *ast.NodeList) string {
 }
 
 func DeclarationNameToString(name *ast.Node) string {
-	if name == nil || name.Pos() == name.End() {
+	if name == nil {
+		return "(Missing)"
+	}
+	if name.Pos() == name.End() {
+		// Synthesized declaration names (for example the bindings produced when lowering Zig
+		// `@import`) use a zero-width range but still carry their text. Prefer the text over the
+		// "(Missing)" placeholder so emitted declarations keep the real name.
+		if text := name.Text(); text != "" {
+			return text
+		}
 		return "(Missing)"
 	}
 	return GetTextOfNode(name)

@@ -190,12 +190,14 @@ func (p *Parser) parseZigFunction(pos int, exported bool) []*ast.Node {
 		return []*ast.Node{result}
 	}
 	p.zigRecordTypeName(name.Text())
-	typeAlias := p.finishNode(p.factory.NewTypeAliasDeclaration(
+	// Keep the synthesized alias bounded to its name: spanning the whole function would leave the
+	// function's tokens in the alias node's trivia, which breaks language-service token navigation.
+	typeAlias := p.finishNodeWithEnd(p.factory.NewTypeAliasDeclaration(
 		p.zigExportModifiers(exported, pos),
 		p.newIdentifierAt(zigTypeAliasName(name.Text()), name.Loc),
 		nil,
 		p.zigUnknownTypeAt(pos),
-	), pos)
+	), pos, name.End())
 	return []*ast.Node{typeAlias, result}
 }
 
@@ -334,6 +336,7 @@ func (p *Parser) parseZigTopLevelBinding(pos int, exported bool) []*ast.Node {
 			return p.token == ast.KindEqualsToken || p.token == ast.KindSemicolonToken
 		})
 	}
+	var valueExpr *ast.Node
 	if p.token == ast.KindEqualsToken {
 		p.nextToken()
 		if spec, ok := p.zigTryParseImportExpression(); ok {
@@ -351,28 +354,46 @@ func (p *Parser) parseZigTopLevelBinding(pos int, exported bool) []*ast.Node {
 			p.zigRecordTypeName(name.Text())
 			return alias
 		}
-		p.zigSkipValue()
+		// Preserve simple initializers (identifiers, property accesses, calls, literals) so the
+		// language service can offer member completions and hovers inside them. Complex or
+		// unsupported values are skipped as before.
+		valueExpr = p.zigTryParseValueExpression()
+		if valueExpr == nil {
+			p.zigSkipValue()
+		}
 	} else {
 		p.zigSkipToSemicolon()
 	}
 
 	valueType := declaredType
-	if valueType == nil {
+	if valueType == nil && valueExpr == nil {
+		// Leave the annotation off when a real initializer was preserved so its inferred type is
+		// used (needed for member completions), otherwise fall back to `unknown`.
 		valueType = p.zigUnknownTypeAt(pos)
 	}
-	decl := p.finishNode(p.factory.NewVariableDeclaration(
-		p.newIdentifierLike(name), nil, valueType, p.zigUnknownValueOfType(valueType, pos),
-	), pos)
+	initializer := valueExpr
+	if initializer == nil {
+		initializer = p.zigUnknownValueOfType(valueType, pos)
+	}
+	// End the declaration at the value (or the name when the value was not modelled) so the node
+	// never spans source text that is not one of its children.
+	end := name.End()
+	if valueExpr != nil {
+		end = valueExpr.End()
+	}
+	decl := p.finishNodeWithEnd(p.factory.NewVariableDeclaration(
+		p.newIdentifierLike(name), nil, valueType, initializer,
+	), pos, end)
 	flags := ast.NodeFlagsLet
 	if isConst {
 		flags = ast.NodeFlagsConst
 	}
-	declList := p.finishNode(p.factory.NewVariableDeclarationList(
-		p.newNodeList(core.NewTextRange(pos, p.nodePos()), []*ast.Node{decl}), flags,
-	), pos)
-	valueStatement := p.finishNode(p.factory.NewVariableStatement(
+	declList := p.finishNodeWithEnd(p.factory.NewVariableDeclarationList(
+		p.newNodeList(core.NewTextRange(pos, end), []*ast.Node{decl}), flags,
+	), pos, end)
+	valueStatement := p.finishNodeWithEnd(p.factory.NewVariableStatement(
 		p.zigExportModifiers(exported, pos), declList,
-	), pos)
+	), pos, end)
 
 	// An unannotated binding may be a Zig type alias (`const X = SomeType;`), so also expose it in
 	// the type namespace. Annotated bindings are values (`const x: T = ...`) and get no alias.
@@ -380,12 +401,14 @@ func (p *Parser) parseZigTopLevelBinding(pos int, exported bool) []*ast.Node {
 		p.zigRecordValueName(name.Text())
 		return []*ast.Node{valueStatement}
 	}
-	typeAlias := p.finishNode(p.factory.NewTypeAliasDeclaration(
+	// Bound the alias to its name; spanning the initializer would put the initializer's tokens in
+	// the alias node's trivia, which breaks language-service token navigation.
+	typeAlias := p.finishNodeWithEnd(p.factory.NewTypeAliasDeclaration(
 		p.zigExportModifiers(exported, pos),
 		p.newIdentifierAt(zigTypeAliasName(name.Text()), name.Loc),
 		nil,
 		p.zigUnknownTypeAt(pos),
-	), pos)
+	), pos, name.End())
 	return []*ast.Node{typeAlias, valueStatement}
 }
 
@@ -522,11 +545,12 @@ func (p *Parser) zigUnknownTypeAt(pos int) *ast.Node {
 	return node
 }
 
-// zigUndefinedExpression creates a permissive `null as unknown` value.
+// zigUndefinedExpression creates a permissive `null as unknown` value. It is zero-width at pos so it
+// never spans source text it has no children for (which would break language-service navigation).
 func (p *Parser) zigUndefinedExpression(pos int) *ast.Node {
 	nullExpr := p.factory.NewToken(ast.KindNullKeyword)
 	nullExpr.Loc = core.NewTextRange(pos, pos)
-	return p.finishNode(p.factory.NewAsExpression(nullExpr, p.zigUnknownTypeAt(pos)), pos)
+	return p.finishNodeWithEnd(p.factory.NewAsExpression(nullExpr, p.zigUnknownTypeAt(pos)), pos, pos)
 }
 
 // zigUnknownValueOfType creates a placeholder initializer assignable to the given type without
@@ -539,7 +563,86 @@ func (p *Parser) zigUnknownValueOfType(typ *ast.Node, pos int) *ast.Node {
 		zigTypeIsKeywordNode(typ, ast.KindVoidKeyword) {
 		return value
 	}
-	return p.finishNode(p.factory.NewAsExpression(value, typ), pos)
+	return p.finishNodeWithEnd(p.factory.NewAsExpression(value, typ), pos, pos)
+}
+
+// zigTryParseValueExpression speculatively parses a binding initializer with the strict expression
+// grammar and keeps it when it is a simple value form the language service can inspect (identifier,
+// property/element access, call, literal, object/array literal). Recovered incomplete expressions
+// (such as a trailing `.` while typing) are kept even though they produce a parse diagnostic, which
+// is discarded. Returns nil (and rewinds) otherwise.
+func (p *Parser) zigTryParseValueExpression() *ast.Node {
+	if expression := p.zigTryParseGenericValueExpression(); expression != nil {
+		return expression
+	}
+	// The generic parse over-consumes a trailing `.` (it reads the next line's token as the property
+	// name). Fall back to a line-aware member access so `foo.` while typing still yields a property
+	// access node for the language service.
+	return p.zigTryParseTrailingMemberAccess()
+}
+
+// zigTryParseGenericValueExpression is the strict-parser-based value parse.
+func (p *Parser) zigTryParseGenericValueExpression() *ast.Node {
+	state := p.mark()
+	before := p.scanner.TokenFullStart()
+	expression := p.parseAssignmentExpressionOrHigher()
+	progressed := p.scanner.TokenFullStart() != before
+	atBoundary := p.token == ast.KindSemicolonToken || p.token == ast.KindEndOfFile ||
+		p.token == ast.KindCommaToken || p.token == ast.KindCloseBraceToken
+	if expression != nil && progressed && atBoundary && isSimpleZigValueExpression(expression) {
+		// Keep the recovered expression but drop the speculative diagnostics it produced.
+		p.diagnostics = p.diagnostics[:state.diagnosticsLen]
+		p.jsDiagnostics = p.jsDiagnostics[:state.jsDiagnosticsLen]
+		p.jsdocInfos = p.jsdocInfos[:state.jsdocInfosLen]
+		p.reparsedClones = p.reparsedClones[:state.reparsedClonesLen]
+		p.hasParseError = state.hasParseError
+		return expression
+	}
+	p.rewind(state)
+	return nil
+}
+
+// zigTryParseTrailingMemberAccess parses `a.b.` (a member access whose final `.` is followed by a
+// line break or boundary, as while typing) without consuming the next line's tokens. Returns nil
+// when the input does not start with such an access.
+func (p *Parser) zigTryParseTrailingMemberAccess() *ast.Node {
+	if !tokenIsIdentifierOrKeyword(p.token) {
+		return nil
+	}
+	state := p.mark()
+	expression := p.newIdentifierLike(p.parseIdentifierName())
+	for p.token == ast.KindDotToken {
+		hasName := p.lookAhead(func(pp *Parser) bool {
+			return pp.nextToken() != ast.KindEndOfFile && tokenIsIdentifierOrKeyword(pp.token) && !pp.hasPrecedingLineBreak()
+		})
+		dotPos := p.nodePos()
+		p.nextToken() // consume `.`
+		if hasName {
+			name := p.parseIdentifierName()
+			expression = p.finishNodeWithEnd(p.factory.NewPropertyAccessExpression(expression, nil, name, ast.NodeFlagsNone), expression.Pos(), p.nodePos())
+			continue
+		}
+		missing := p.newIdentifierAt("", core.NewTextRange(dotPos, dotPos))
+		expression = p.finishNodeWithEnd(p.factory.NewPropertyAccessExpression(expression, nil, missing, ast.NodeFlagsNone), expression.Pos(), p.nodePos())
+		return expression
+	}
+	p.rewind(state)
+	return nil
+}
+
+// isSimpleZigValueExpression reports whether an expression is simple enough to preserve in the
+// permissive AST.
+func isSimpleZigValueExpression(node *ast.Node) bool {
+	switch node.Kind {
+	case ast.KindIdentifier, ast.KindPropertyAccessExpression, ast.KindElementAccessExpression,
+		ast.KindCallExpression, ast.KindParenthesizedExpression,
+		ast.KindStringLiteral, ast.KindNumericLiteral, ast.KindBigIntLiteral,
+		ast.KindTrueKeyword, ast.KindFalseKeyword, ast.KindNullKeyword,
+		ast.KindObjectLiteralExpression, ast.KindArrayLiteralExpression,
+		ast.KindAsExpression, ast.KindNonNullExpression:
+		return true
+	}
+	return false
 }
 
 // zigVoidTypeAt creates a `void` keyword type anchored at pos.
