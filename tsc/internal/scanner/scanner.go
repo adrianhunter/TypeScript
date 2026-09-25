@@ -2503,8 +2503,16 @@ func GetShebang(text string) string {
 }
 
 func GetScannerForSourceFile(sourceFile *ast.SourceFile, pos int) *Scanner {
+	if pos < 0 {
+		// Synthesized nodes can report a `-1` position; scanning from there would index out of
+		// range. Clamp to the start of the file.
+		pos = 0
+	}
 	s := NewScanner()
 	s.text = sourceFile.Text()
+	if pos > len(s.text) {
+		pos = len(s.text)
+	}
 	s.pos = pos
 	s.end = len(s.text)
 	s.languageVariant = sourceFile.LanguageVariant

@@ -38,22 +38,18 @@ func (p *Parser) zigParseSelfContainerFile() []*ast.Node {
 	end := p.nodePos()
 	loc := core.NewTextRange(0, len(p.sourceText))
 	synth := core.NewTextRange(-1, -1)
-	out := []*ast.Node{p.finishNode(p.factory.NewClassDeclaration(
+	// Both the class and the default-export reference are synthesized (`-1`): the reference must
+	// print its name (not the source text), and using the same position avoids a spurious
+	// "used before its declaration".
+	out := []*ast.Node{p.finishNodeWithEnd(p.factory.NewClassDeclaration(
 		nil, p.newIdentifierAt("Self", synth), nil, nil, p.newNodeList(loc, classMembers),
-	), 0)}
-	if len(namespaceMembers) > 0 {
-		moduleBlock := p.finishNodeWithEnd(p.factory.NewModuleBlock(p.newNodeList(loc, namespaceMembers)), 0, end)
-		namespace := p.finishNodeWithEnd(p.factory.NewModuleDeclaration(
-			nil, ast.KindModuleKeyword, p.newIdentifierAt("Self", synth), nil, moduleBlock,
-		), 0, end)
-		namespace.Flags |= ast.NodeFlagsModuleFragment
-		out = append(out, namespace)
-	}
-	// An export assignment is already an export; it must not also carry an export modifier. The
-	// `Self` reference must be positioned after the class declaration (a synthesized `-1` would be
-	// treated as "used before its declaration").
+	), -1, -1)}
+	// Emit the non-field declarations as top-level siblings rather than nesting them in a `Self`
+	// namespace: nesting them broke hover/type resolution for nested containers and their fields.
+	out = append(out, namespaceMembers...)
+	// An export assignment is already an export; it must not also carry an export modifier.
 	out = append(out, p.finishNodeWithEnd(p.factory.NewExportAssignment(
-		nil, false, nil, p.newIdentifierAt("Self", core.NewTextRange(end, end)),
+		nil, false, nil, p.newIdentifierAt("Self", synth),
 	), 0, end))
 	return out
 }
@@ -302,69 +298,10 @@ func (p *Parser) zigParseContainerMethod(pos int, exported bool) *ast.Node {
 
 // zigParseContainerBinding parses a nested `const`/`var` declaration inside a container.
 func (p *Parser) zigParseContainerBinding(pos int, exported bool) []*ast.Node {
-	isConst := p.token == ast.KindConstKeyword
-	p.nextToken()
-	if !tokenIsIdentifierOrKeyword(p.token) {
-		p.zigSkipToSemicolon()
-		return nil
-	}
-	nameIsKeyword := p.token != ast.KindIdentifier
-	name := p.parseIdentifierName()
-	if nameIsKeyword {
-		name = p.newIdentifierAt("_"+name.Text()+"_"+strconv.Itoa(pos), name.Loc)
-	}
-	declaredType := (*ast.Node)(nil)
-	if p.token == ast.KindColonToken {
-		p.nextToken()
-		declaredType = p.zigTryParseType(pos, func() bool {
-			return p.token == ast.KindEqualsToken || p.token == ast.KindSemicolonToken || p.token == ast.KindCommaToken || p.token == ast.KindCloseBraceToken
-		})
-	}
-	if p.token == ast.KindEqualsToken {
-		p.nextToken()
-		if spec, specLoc, ok := p.zigTryParseImportExpression(); ok {
-			p.parseOptional(ast.KindSemicolonToken)
-			return p.zigHoistContainerImport(name, spec, exported, pos, specLoc)
-		}
-		if container := p.zigTryParseContainer(name, exported, pos); container != nil {
-			return container
-		}
-		if alias := p.zigTryParseQualifiedAlias(name, exported, pos, true); alias != nil {
-			return alias
-		}
-		p.zigSkipValue()
-	} else {
-		p.zigSkipToSemicolon()
-	}
-
-	valueType := declaredType
-	if valueType == nil {
-		valueType = p.zigUnknownTypeAt(pos)
-	}
-	end := name.End()
-	decl := p.finishNodeWithEnd(p.factory.NewVariableDeclaration(
-		p.newIdentifierLike(name), nil, valueType, p.zigUnknownValueOfType(valueType, pos),
-	), pos, end)
-	flags := ast.NodeFlagsLet
-	if isConst {
-		flags = ast.NodeFlagsConst
-	}
-	declList := p.finishNodeWithEnd(p.factory.NewVariableDeclarationList(
-		p.newNodeList(core.NewTextRange(pos, end), []*ast.Node{decl}), flags,
-	), pos, end)
-	valueStatement := p.finishNodeWithEnd(p.factory.NewVariableStatement(
-		p.zigExportModifiers(exported, pos), declList,
-	), pos, end)
-	if declaredType != nil {
-		return []*ast.Node{valueStatement}
-	}
-	typeAlias := p.finishNodeWithEnd(p.factory.NewTypeAliasDeclaration(
-		p.zigExportModifiers(exported, pos),
-		p.newIdentifierAt(zigTypeAliasName(name.Text()), name.Loc),
-		nil,
-		p.zigUnknownTypeAt(pos),
-	), pos, name.End())
-	return []*ast.Node{typeAlias, valueStatement}
+	// Use the same rich lowering as top-level bindings so container-member values
+	// (`Foo{ ... }`, `@typeInfo(Foo)`, `switch (...)`, nested containers, `@import`) keep real
+	// types instead of collapsing to `unknown`. `pos`/`exported` are already parsed by the caller.
+	return p.parseZigTopLevelBinding(pos, exported)
 }
 
 // zigHoistContainerImport turns a container-level `const X = @import("spec")` into a module-scope

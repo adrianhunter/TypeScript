@@ -103,7 +103,9 @@ func getTokenAtPosition(
 	visitNode := func(node *ast.Node, _ *ast.NodeVisitor) *ast.Node {
 		// We can't abort visiting children, so once a match is found, we set `next`
 		// and do nothing on subsequent visits.
-		if node == nil || node.Flags&ast.NodeFlagsReparsed != 0 {
+		if node == nil || node.Flags&ast.NodeFlagsReparsed != 0 || node.Pos() < 0 {
+			// Synthesized nodes have no source position; including them can move the scan
+			// boundary to `-1` (and, before that, panic the scanner).
 			return nil
 		}
 		if nodeAfterLeft == nil {
@@ -132,64 +134,45 @@ func getTokenAtPosition(
 		if nodeList == nil || len(nodeList.Nodes) == 0 {
 			return nodeList
 		}
+		usable := func(node *ast.Node) bool {
+			return node.Flags&ast.NodeFlagsReparsed == 0 && node.Pos() >= 0
+		}
 		if nodeAfterLeft == nil {
 			for _, node := range nodeList.Nodes {
-				if node.Flags&ast.NodeFlagsReparsed == 0 {
+				if usable(node) {
 					nodeAfterLeft = node
 					break
 				}
 			}
 		}
 		if next == nil {
-			if nodeList.End() == position && includePrecedingTokenAtEndPosition != nil {
-				left = nodeList.End()
+			listEnd := nodeList.End()
+			listPos := nodeList.Pos()
+			if listEnd == position && includePrecedingTokenAtEndPosition != nil {
+				left = listEnd
 				nodeAfterLeft = nil
 				for _, v := range slices.Backward(nodeList.Nodes) {
-					if v.Flags&ast.NodeFlagsReparsed == 0 {
+					if usable(v) {
 						prevSubtree = v
 						break
 					}
 				}
-			} else if nodeList.End() <= position {
-				left = nodeList.End()
+			} else if listEnd >= 0 && listEnd <= position {
+				left = listEnd
 				nodeAfterLeft = nil
-			} else if nodeList.Pos() <= position {
-				nodes := nodeList.Nodes
+			} else if listPos >= 0 && listPos <= position {
+				nodes := core.Filter(nodeList.Nodes, usable)
 				index, match := core.BinarySearchUniqueFunc(nodes, func(middle int, node *ast.Node) int {
-					if node.Flags&ast.NodeFlagsReparsed != 0 {
-						return 0
-					}
 					cmp := testNode(node)
 					if cmp < 0 {
 						left = node.End()
 						nodeAfterLeft = nil
-						for i := middle + 1; i < len(nodes); i++ {
-							if nodes[i].Flags&ast.NodeFlagsReparsed == 0 {
-								nodeAfterLeft = nodes[i]
-								break
-							}
+						if middle+1 < len(nodes) {
+							nodeAfterLeft = nodes[middle+1]
 						}
 					}
 					return cmp
 				})
-				if match && nodes[index].Flags&ast.NodeFlagsReparsed != 0 {
-					// filter and search again
-					nodes = core.Filter(nodes, func(node *ast.Node) bool {
-						return node.Flags&ast.NodeFlagsReparsed == 0
-					})
-					index, match = core.BinarySearchUniqueFunc(nodes, func(middle int, node *ast.Node) int {
-						cmp := testNode(node)
-						if cmp < 0 {
-							left = node.End()
-							if middle+1 < len(nodes) {
-								nodeAfterLeft = nodes[middle+1]
-							} else {
-								nodeAfterLeft = nil
-							}
-						}
-						return cmp
-					})
-				}
 				if match {
 					next = nodes[index]
 				}
