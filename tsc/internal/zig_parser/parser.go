@@ -101,6 +101,13 @@ type Parser struct {
 	currentParent        *ast.Node
 	setParentFromContext ast.Visitor
 	reparsedClones       []*ast.Node
+
+	// Zig container (`struct { ... }`) support. `inZigStructBody` is set while parsing the body of a
+	// container expression so that fields (`name: Type = value;`) parse as property declarations
+	// instead of labeled statements. `zigStructExprs` records the module expressions that came from a
+	// `struct` keyword so they can later be desugared into class/interface/module declarations.
+	inZigStructBody bool
+	zigStructExprs  map[*ast.Node]bool
 }
 
 func newParser() *Parser {
@@ -437,6 +444,9 @@ func (p *Parser) parseSourceFileWorker() *ast.SourceFile {
 	}
 	pos := p.nodePos()
 	statements := p.parseListIndex(PCSourceElements, (*Parser).parseToplevelStatement)
+	if len(p.zigStructExprs) != 0 {
+		statements = p.desugarZigStructs(statements)
+	}
 	end := p.nodePos()
 	endJSDoc := p.jsdocScannerInfo()
 	eof := p.parseTokenNode()
@@ -2281,7 +2291,14 @@ func (p *Parser) parseModuleBlock() *ast.Node {
 	pos := p.nodePos()
 	var statements *ast.NodeList
 	if p.parseExpected(ast.KindOpenBraceToken) {
-		statements = p.parseList(PCBlockStatements, (*Parser).parseStatement)
+		parseElement := (*Parser).parseStatement
+		if p.inZigStructBody {
+			parseElement = (*Parser).parseZigContainerMember
+		}
+		statements = p.parseList(PCBlockStatements, parseElement)
+		if len(p.zigStructExprs) != 0 {
+			statements.Nodes = p.desugarZigStructs(statements.Nodes)
+		}
 		p.parseExpected(ast.KindCloseBraceToken)
 	} else {
 		statements = p.createMissingList()
@@ -5699,17 +5716,31 @@ func (p *Parser) parsePrimaryExpression() *ast.Expression {
 func (p *Parser) parseModuleExpression() *ast.Expression {
 	pos := p.nodePos()
 	jsdoc := p.jsdocScannerInfo()
+	// The scanner maps Zig's `struct` keyword onto `module`, so remember whether this module expression
+	// was actually written as a Zig container before the token is consumed.
+	isZigStruct := p.token == ast.KindModuleKeyword && p.scanner.TokenValue() == "struct"
 	p.parseExpected(ast.KindModuleKeyword)
 	// Statements inside a module expression body live in their own module scope, so `module X { ... }`
 	// declarations nested within them are TC39 module declarations too.
 	savedInModuleFragment := p.inModuleFragment
 	p.inModuleFragment = true
+	savedInZigStructBody := p.inZigStructBody
+	if isZigStruct {
+		p.inZigStructBody = true
+	}
 	body := p.doInContext(ast.NodeFlagsAwaitContext, true, func(p *Parser) *ast.Node {
 		return p.parseModuleBlock()
 	})
+	p.inZigStructBody = savedInZigStructBody
 	p.inModuleFragment = savedInModuleFragment
 	result := p.finishNode(p.factory.NewModuleExpression(body), pos)
 	p.withJSDoc(result, jsdoc)
+	if isZigStruct {
+		if p.zigStructExprs == nil {
+			p.zigStructExprs = make(map[*ast.Node]bool)
+		}
+		p.zigStructExprs[result] = true
+	}
 	return result
 }
 
