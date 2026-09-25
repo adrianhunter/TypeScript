@@ -107,13 +107,36 @@ func (p *Parser) parseZigContainerLiteral(pos int) *ast.Expression {
 
 // parseZigLiteralElement parses one element of a `.{ ... }` literal.
 func (p *Parser) parseZigLiteralElement() *ast.Node {
-	if p.token == ast.KindDotToken && p.lookAhead((*Parser).zigLiteralIsFieldAssignment) {
-		pos := p.nodePos()
-		p.nextToken() // '.'
-		name := p.parseIdentifierName()
-		p.nextToken() // '='
-		value := p.parseAssignmentExpressionOrHigher()
-		return p.finishNode(p.factory.NewPropertyAssignment(nil, name, nil, nil, value), pos)
+	if p.token == ast.KindDotToken {
+		if p.lookAhead((*Parser).zigLiteralIsFieldAssignment) {
+			dotStart := p.scanner.TokenStart()
+			p.nextToken() // '.'
+			name := p.parseIdentifierName()
+			// Extend the name over the leading dot so the language service sees `{` / `,` as the token
+			// preceding the member name and offers the container's fields.
+			name.Loc = core.NewTextRange(dotStart, name.End())
+			p.nextToken() // '='
+			value := p.parseAssignmentExpressionOrHigher()
+			return p.finishNode(p.factory.NewPropertyAssignment(nil, name, nil, nil, value), dotStart)
+		}
+		// `.name` / `.` (before the `=` is typed) in a struct literal: keep it an object-literal
+		// member so the language service offers the contextual type's fields. Array literals keep
+		// their previous handling.
+		if p.zigContextualType != nil && p.zigContextualType.Kind != ast.KindArrayType {
+			dotStart := p.scanner.TokenStart()
+			dotEnd := p.scanner.TokenEnd()
+			p.nextToken() // '.'
+			var name *ast.Node
+			if p.token == ast.KindIdentifier {
+				name = p.parseIdentifierName()
+				// Extend the name over the leading dot so `.name` reads as a single member token and
+				// completion triggers right after the dot.
+				name.Loc = core.NewTextRange(dotStart, name.End())
+			} else {
+				name = p.newIdentifierAt("", core.NewTextRange(dotStart, dotEnd))
+			}
+			return p.finishNode(p.factory.NewPropertyAssignment(nil, name, nil, nil, nil), dotStart)
+		}
 	}
 	return p.parseAssignmentExpressionOrHigher()
 }
