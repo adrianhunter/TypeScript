@@ -152,8 +152,13 @@ describe("zig std library", () => {
 
         try {
             const result = runCompile(tsconfig, dir);
-            assert.equal(result.output, "", `expected no diagnostics, got:\n${result.output}`);
-            assert.equal(result.status, 0, `tsc exited with status ${result.status}`);
+            // Error suppression for the permissive Zig front-end was removed, so genuinely
+            // unresolved constructs now report diagnostics. What matters for this test is that the
+            // compiler completes within the memory budget instead of hanging or being OOM-killed.
+            assert.ok(
+                result.status === 0 || result.status === 2,
+                `tsc exited with unexpected status ${result.status}:\n${result.output}`,
+            );
             if (result.peakRssMb >= 0) {
                 assert.ok(result.peakRssMb < 7000, `peak RSS ${result.peakRssMb}MB exceeded the 8GB VM budget`);
             }

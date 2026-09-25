@@ -49,8 +49,9 @@ func (p *Parser) zigParseSelfContainerFile() []*ast.Node {
 		namespace.Flags |= ast.NodeFlagsModuleFragment
 		out = append(out, namespace)
 	}
+	// An export assignment is already an export; it must not also carry an export modifier.
 	out = append(out, p.finishNodeWithEnd(p.factory.NewExportAssignment(
-		p.zigExportModifiers(true, 0), false, nil, p.newIdentifierAt("Self", synth),
+		nil, false, nil, p.newIdentifierAt("Self", synth),
 	), 0, end))
 	return out
 }

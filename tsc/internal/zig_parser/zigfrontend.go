@@ -48,11 +48,6 @@ func (p *Parser) parseZigSourceFile() *ast.SourceFile {
 	node := p.finishNode(p.factory.NewSourceFile(p.opts, p.sourceText, p.newNodeList(core.NewTextRange(pos, end), statements), eof), pos)
 	result := node.AsSourceFile()
 	p.finishSourceFile(result, false)
-	// The permissive front-end approximates genuine Zig as best it can; its declarations are emitted
-	// but not type-checked, so approximations do not surface as cascading errors. The strict dialect
-	// parser (used for files it fully understands, such as the `src/**/*.zig` dialect) is still
-	// checked normally.
-	result.CheckJsDirective = &ast.CheckJsDirective{Enabled: false, Range: ast.CommentRange{TextRange: core.NewTextRange(pos, pos)}}
 	collectExternalModuleReferences(result)
 	return result
 }

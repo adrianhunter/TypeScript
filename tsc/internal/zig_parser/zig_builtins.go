@@ -39,7 +39,7 @@ func (p *Parser) parseZigBuiltinExpression() *ast.Expression {
 	case "import":
 		// A `const X = @import("spec")` binding is hoisted to a real module import by the desugar
 		// pass. Any other use has no module to bind to and degrades to a permissive value.
-		expression := p.zigGlobalThisAny(pos)
+		expression := p.zigGlobalThisUnknown(pos)
 		spec := ""
 		if len(args) > 0 && (args[0].Kind == ast.KindStringLiteral || args[0].Kind == ast.KindNoSubstitutionTemplateLiteral) {
 			spec = args[0].Text()
@@ -90,18 +90,19 @@ func (p *Parser) zigBuiltinCall(name string, args []*ast.Node, pos int) *ast.Exp
 	return p.finishNode(p.factory.NewCallExpression(callee, nil, nil, argList, ast.NodeFlagsNone), pos)
 }
 
-// zigAnyKeywordType synthesizes an `any` keyword type.
-func (p *Parser) zigAnyKeywordType() *ast.Node {
-	node := p.factory.NewKeywordTypeNode(ast.KindAnyKeyword)
+// zigUnknownKeywordType synthesizes an `unknown` keyword type. Zig's `any` is deliberately never
+// emitted: `unknown` keeps values assignable but requires checking before use, so mistakes surface.
+func (p *Parser) zigUnknownKeywordType() *ast.Node {
+	node := p.factory.NewKeywordTypeNode(ast.KindUnknownKeyword)
 	node.Loc = core.NewTextRange(-1, -1)
 	return node
 }
 
-// zigGlobalThisAny builds `(globalThis as any)`.
-func (p *Parser) zigGlobalThisAny(pos int) *ast.Expression {
+// zigGlobalThisUnknown builds `(globalThis as unknown)`.
+func (p *Parser) zigGlobalThisUnknown(pos int) *ast.Expression {
 	globalThis := p.factory.NewIdentifier("globalThis")
 	globalThis.Loc = core.NewTextRange(-1, -1)
-	asExpression := p.finishNodeWithEnd(p.factory.NewAsExpression(globalThis, p.zigAnyKeywordType()), -1, -1)
+	asExpression := p.finishNodeWithEnd(p.factory.NewAsExpression(globalThis, p.zigUnknownKeywordType()), -1, -1)
 	return p.finishNodeWithEnd(p.factory.NewParenthesizedExpression(asExpression), pos, p.nodePos())
 }
 
@@ -191,7 +192,7 @@ func (p *Parser) zigImportDeclaration(name, spec string, pos int, specLoc core.T
 	if spec == "" || spec == "builtin" || spec == "root" {
 		globalThis := p.factory.NewIdentifier("globalThis")
 		globalThis.Loc = core.NewTextRange(-1, -1)
-		initializer := p.finishNodeWithEnd(p.factory.NewAsExpression(globalThis, p.zigAnyKeywordType()), -1, -1)
+		initializer := p.finishNodeWithEnd(p.factory.NewAsExpression(globalThis, p.zigUnknownKeywordType()), -1, -1)
 		decl := p.finishNodeWithEnd(p.factory.NewVariableDeclaration(nameIdentifier, nil, nil, initializer), pos, pos)
 		declList := p.finishNodeWithEnd(p.factory.NewVariableDeclarationList(p.newNodeList(core.NewTextRange(pos, pos), []*ast.Node{decl}), ast.NodeFlagsConst), pos, pos)
 		return p.finishNodeWithEnd(p.factory.NewVariableStatement(nil, declList), pos, pos)
