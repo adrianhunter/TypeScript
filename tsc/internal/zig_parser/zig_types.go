@@ -56,6 +56,11 @@ func (p *Parser) zigBuiltinTypeAtCurrent() (ast.Kind, bool) {
 	return kind, true
 }
 
+// zigIsUndefinedExpression reports whether the expression is Zig's `undefined` initializer.
+func (p *Parser) zigIsUndefinedExpression(expression *ast.Node) bool {
+	return expression != nil && expression.Kind == ast.KindIdentifier && expression.Text() == "undefined"
+}
+
 // parseZigOptionalType parses a Zig optional type `?T` and lowers it to `T | null`.
 func (p *Parser) parseZigOptionalType() *ast.Node {
 	pos := p.nodePos()

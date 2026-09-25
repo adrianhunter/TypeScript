@@ -172,6 +172,11 @@ func (p *Parser) parseZigContainerField() *ast.Node {
 	p.zigContextualType = typeNode
 	initializer := p.doInContext(ast.NodeFlagsYieldContext|ast.NodeFlagsAwaitContext|ast.NodeFlagsDisallowInContext, false, (*Parser).parseInitializer)
 	p.zigContextualType = savedContextualType
+	// Zig's `undefined` initializer means "leave uninitialized"; drop it so the field is treated as
+	// definitely assigned instead of producing a `undefined` is not assignable` error.
+	if p.zigIsUndefinedExpression(initializer) {
+		initializer = nil
+	}
 	// Zig fields are always assigned when a value is constructed, so a field without a default value
 	// is definitely assigned. Mark it with `!` so `strictPropertyInitialization` is happy.
 	var postfixToken *ast.Node
@@ -196,7 +201,7 @@ func (p *Parser) desugarZigStructs(statements []*ast.Node) []*ast.Node {
 	}
 
 	// Discover `fn F() type { return struct { ... }; }` factories in this scope.
-	factories := map[string]*ast.Node{}
+	factories := map[string]*zigTypeFactory{}
 	for _, stmt := range statements {
 		if stmt.Kind != ast.KindFunctionDeclaration {
 			continue
@@ -207,7 +212,7 @@ func (p *Parser) desugarZigStructs(statements []*ast.Node) []*ast.Node {
 			continue
 		}
 		if ret := p.zigTypeFactoryReturn(stmt); ret != nil {
-			factories[name.Text()] = ret
+			factories[name.Text()] = &zigTypeFactory{fn: stmt, ret: ret}
 		}
 	}
 
@@ -228,7 +233,8 @@ func (p *Parser) desugarZigStructs(statements []*ast.Node) []*ast.Node {
 	}
 	// A factory whose container was never inlined would leave property declarations inside a module
 	// block, which is an invalid tree shape. Replace those returns with an equivalent class expression.
-	for _, ret := range factories {
+	for _, factory := range factories {
+		ret := factory.ret
 		if consumed[ret] {
 			continue
 		}
@@ -244,7 +250,13 @@ func (p *Parser) desugarZigStructs(statements []*ast.Node) []*ast.Node {
 
 // expandZigStruct expands a single `const X = struct { ... }` variable statement, or a
 // `const X = F()` call to an in-scope type factory. It returns false when the statement is neither.
-func (p *Parser) expandZigStruct(stmt *ast.Node, factories map[string]*ast.Node, consumed map[*ast.Node]bool) ([]*ast.Node, bool) {
+// zigTypeFactory is a discovered `fn F(...) type { return struct { ... }; }` declaration.
+type zigTypeFactory struct {
+	fn  *ast.Node
+	ret *ast.Node
+}
+
+func (p *Parser) expandZigStruct(stmt *ast.Node, factories map[string]*zigTypeFactory, consumed map[*ast.Node]bool) ([]*ast.Node, bool) {
 	if stmt.Kind != ast.KindVariableStatement {
 		return nil, false
 	}
@@ -291,11 +303,11 @@ func (p *Parser) expandZigStruct(stmt *ast.Node, factories map[string]*ast.Node,
 	if init.Kind == ast.KindCallExpression {
 		callee := init.AsCallExpression().Expression
 		if callee != nil && callee.Kind == ast.KindIdentifier {
-			ret, ok := factories[callee.Text()]
-			if !ok || consumed[ret] {
+			factory, ok := factories[callee.Text()]
+			if !ok || consumed[factory.ret] {
 				return nil, false
 			}
-			structExpr := ret.AsReturnStatement().Expression
+			structExpr := factory.ret.AsReturnStatement().Expression
 			if structExpr == nil || structExpr.Kind != ast.KindModuleExpression {
 				return nil, false
 			}
@@ -303,15 +315,124 @@ func (p *Parser) expandZigStruct(stmt *ast.Node, factories map[string]*ast.Node,
 			if body == nil || body.Kind != ast.KindModuleBlock {
 				return nil, false
 			}
-			consumed[ret] = true
+			consumed[factory.ret] = true
+			// Instantiate the factory: substitute its type parameters with the call arguments and
+			// rewrite self-references to the synthesized type name.
+			p.zigSubstituteFactoryTypes(body, factory, init.AsCallExpression(), nameNode.Text())
 			// The factory now returns the synthesized type's value, so the anonymous container
-			// never reaches the binder.
-			ret.AsReturnStatement().Expression = p.newIdentifierAt(nameNode.Text(), structExpr.Loc)
-			p.overrideParentInImmediateChildren(ret)
+			// never reaches the binder. Reuse the call-site name's location so the printer emits the
+			// synthesized type name rather than the original `struct { ... }` source text.
+			factory.ret.AsReturnStatement().Expression = p.newIdentifierAt(nameNode.Text(), nameNode.Loc)
+			p.overrideParentInImmediateChildren(factory.ret)
 			return p.zigContainerDeclarations(nameNode, body, exported, start, end), true
 		}
 	}
 	return nil, false
+}
+
+// zigSubstituteFactoryTypes rewrites the body of an inlined type factory: each factory parameter is
+// replaced by the matching call argument (when used as a type), and references to the factory name
+// are rewritten to the synthesized type name. This makes `MakeArray(i32)` produce a concrete
+// `IntArray` instead of leaking the generic parameter `T` and the factory name.
+func (p *Parser) zigSubstituteFactoryTypes(body *ast.Node, factory *zigTypeFactory, call *ast.CallExpression, newName string) {
+	fnDecl := factory.fn.AsFunctionDeclaration()
+	paramTypes := map[string]*ast.Node{}
+	if fnDecl != nil && fnDecl.Parameters != nil && call != nil && call.Arguments != nil {
+		for i, param := range fnDecl.Parameters.Nodes {
+			if i >= len(call.Arguments.Nodes) {
+				break
+			}
+			paramDecl := param.AsParameterDeclaration()
+			if paramDecl == nil {
+				continue
+			}
+			paramName := paramDecl.Name()
+			if paramName == nil || paramName.Kind != ast.KindIdentifier {
+				continue
+			}
+			if argType := p.zigExpressionToTypeNode(call.Arguments.Nodes[i]); argType != nil {
+				paramTypes[paramName.Text()] = argType
+			}
+		}
+	}
+	factoryName := ""
+	if fnDecl != nil && fnDecl.Name() != nil {
+		factoryName = fnDecl.Name().Text()
+	}
+	for _, member := range body.AsModuleBlock().Statements.Nodes {
+		p.zigSubstituteFactoryMember(member, paramTypes, factoryName, newName)
+	}
+}
+
+// zigSubstituteFactoryMember applies factory substitution to the type annotations of one member.
+func (p *Parser) zigSubstituteFactoryMember(member *ast.Node, paramTypes map[string]*ast.Node, factoryName, newName string) {
+	switch member.Kind {
+	case ast.KindPropertyDeclaration:
+		property := member.AsPropertyDeclaration()
+		property.Type = p.zigSubstituteFactoryTypeNode(property.Type, paramTypes, factoryName, newName)
+	case ast.KindFunctionDeclaration:
+		function := member.AsFunctionDeclaration()
+		if function.Parameters != nil {
+			for _, param := range function.Parameters.Nodes {
+				paramDecl := param.AsParameterDeclaration()
+				if paramDecl != nil {
+					paramDecl.Type = p.zigSubstituteFactoryTypeNode(paramDecl.Type, paramTypes, factoryName, newName)
+				}
+			}
+		}
+		function.Type = p.zigSubstituteFactoryTypeNode(function.Type, paramTypes, factoryName, newName)
+	}
+	// Rewritten/new children need their parent pointers restored for the binder.
+	p.zigFixParents(member, member.Parent)
+}
+
+// zigFixParents recursively restores parent pointers after a subtree was rewritten.
+func (p *Parser) zigFixParents(node *ast.Node, parent *ast.Node) {
+	if node == nil {
+		return
+	}
+	node.Parent = parent
+	node.ForEachChild(func(child *ast.Node) bool {
+		p.zigFixParents(child, node)
+		return false
+	})
+}
+
+// zigSubstituteFactoryTypeNode rewrites a single type node for factory instantiation.
+func (p *Parser) zigSubstituteFactoryTypeNode(node *ast.Node, paramTypes map[string]*ast.Node, factoryName, newName string) *ast.Node {
+	if node == nil {
+		return nil
+	}
+	switch node.Kind {
+	case ast.KindTypeReference:
+		reference := node.AsTypeReferenceNode()
+		if reference.TypeName == nil || reference.TypeName.Kind != ast.KindIdentifier {
+			return node
+		}
+		name := reference.TypeName.Text()
+		if replacement, ok := paramTypes[name]; ok {
+			return p.factory.DeepCloneReparse(replacement)
+		}
+		if name == factoryName && factoryName != newName {
+			// Use a synthesized location so the printer emits the new text instead of the source text.
+			reference.TypeName = p.newIdentifierAt(newName, core.NewTextRange(-1, -1))
+			reference.TypeArguments = nil
+		}
+		return node
+	case ast.KindArrayType:
+		array := node.AsArrayTypeNode()
+		array.ElementType = p.zigSubstituteFactoryTypeNode(array.ElementType, paramTypes, factoryName, newName)
+		return node
+	case ast.KindUnionType:
+		union := node.AsUnionTypeNode()
+		if union.Types != nil {
+			for i, member := range union.Types.Nodes {
+				union.Types.Nodes[i] = p.zigSubstituteFactoryTypeNode(member, paramTypes, factoryName, newName)
+			}
+		}
+		return node
+	}
+	return node
 }
 
 // zigContainerDeclarations builds the `class X` + `interface X` + `module X` triple for a container

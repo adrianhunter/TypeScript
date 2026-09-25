@@ -2962,6 +2962,11 @@ func (p *Parser) parseNonArrayType() *ast.Node {
 		return p.parseTypeReference()
 	case ast.KindVoidKeyword:
 		return p.parseKeywordTypeNode()
+	case ast.KindTypeKeyword:
+		// Zig's `type` (a comptime type value) has no TypeScript equivalent.
+		pos := p.nodePos()
+		p.nextToken()
+		return p.finishNode(p.factory.NewKeywordTypeNode(ast.KindUnknownKeyword), pos)
 	case ast.KindThisKeyword:
 		thisKeyword := p.parseThisTypeNode()
 		if p.token == ast.KindIsKeyword && !p.hasPrecedingLineBreak() {
@@ -3073,7 +3078,14 @@ func (p *Parser) parseTypeReference() *ast.Node {
 		p.nextToken()
 		return p.finishNode(p.factory.NewKeywordTypeNode(kind), pos)
 	}
-	return p.finishNode(p.factory.NewTypeReferenceNode(p.parseEntityNameOfTypeReference(), p.parseTypeArgumentsOfTypeReference()), pos)
+	entity := p.parseEntityNameOfTypeReference()
+	// Zig instantiates generics with parentheses (`Foo(T)`), which has no TypeScript type-reference
+	// equivalent; the arguments are consumed and erased.
+	if p.token == ast.KindOpenParenToken {
+		p.zigSkipBalanced(ast.KindOpenParenToken, ast.KindCloseParenToken)
+		return p.finishNode(p.factory.NewTypeReferenceNode(entity, nil), pos)
+	}
+	return p.finishNode(p.factory.NewTypeReferenceNode(entity, p.parseTypeArgumentsOfTypeReference()), pos)
 }
 
 func (p *Parser) parseEntityNameOfTypeReference() *ast.Node {
@@ -3504,6 +3516,10 @@ func (p *Parser) parseParameterEx(inOuterAwaitContext bool, allowAmbiguity bool)
 	p.setContextFlags(ast.NodeFlagsAwaitContext, inOuterAwaitContext)
 	modifiers := p.parseModifiersEx(true /*allowDecorators*/, false /*permitConstAsModifier*/, false /*stopOnStartOfClassStaticBlock*/)
 	p.contextFlags = saveContextFlags
+	// Zig parameter modifiers (`comptime`, `noalias`) precede the parameter name.
+	for p.zigIsIdent("comptime") || p.zigIsIdent("noalias") {
+		p.nextToken()
+	}
 	if p.token == ast.KindThisKeyword {
 		result := p.factory.NewParameterDeclaration(
 			modifiers,
@@ -5775,6 +5791,12 @@ func (p *Parser) parsePrimaryExpression() *ast.Expression {
 		return p.parseLiteralExpression()
 	case ast.KindThisKeyword, ast.KindSuperKeyword, ast.KindNullKeyword, ast.KindTrueKeyword, ast.KindFalseKeyword:
 		return p.parseKeywordExpression()
+	case ast.KindUndefinedKeyword:
+		// Zig's `undefined` initializer.
+		undefinedPos := p.nodePos()
+		undefined := p.factory.NewIdentifier("undefined")
+		p.nextToken()
+		return p.finishNode(undefined, undefinedPos)
 	case ast.KindOpenParenToken:
 		return p.parseParenthesizedExpression()
 	case ast.KindOpenBracketToken:
