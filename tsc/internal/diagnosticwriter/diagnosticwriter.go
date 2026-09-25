@@ -570,7 +570,13 @@ func WriteFormatDiagnostics(output io.Writer, diagnostics []Diagnostic, formatOp
 
 func WriteFormatDiagnostic(output io.Writer, diagnostic Diagnostic, formatOpts *FormattingOptions) {
 	if diagnostic.File() != nil {
-		line, character := scanner.GetECMALineAndUTF16CharacterOfPosition(diagnostic.File(), diagnostic.Pos())
+		pos := diagnostic.Pos()
+		if pos < 0 {
+			// Synthesized nodes can carry a `-1` location; report them at the start of the file
+			// rather than panicking while formatting.
+			pos = 0
+		}
+		line, character := scanner.GetECMALineAndUTF16CharacterOfPosition(diagnostic.File(), pos)
 		fileName := diagnostic.File().FileName()
 		relativeFileName := tspath.ConvertToRelativePath(fileName, formatOpts.ComparePathsOptions)
 		fmt.Fprintf(output, "%s(%d,%d): ", relativeFileName, line+1, int(character)+1)

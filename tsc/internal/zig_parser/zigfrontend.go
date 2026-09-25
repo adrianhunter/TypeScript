@@ -28,6 +28,10 @@ func (p *Parser) parseZigSourceFile() *ast.SourceFile {
 			p.nextToken()
 		}
 	}
+	if len(p.zigHoistedImports) != 0 {
+		statements = append(p.zigHoistedImports, statements...)
+		p.zigHoistedImports = nil
+	}
 	end := p.nodePos()
 	endJSDoc := p.jsdocScannerInfo()
 	eof := p.parseTokenNode()
@@ -38,6 +42,11 @@ func (p *Parser) parseZigSourceFile() *ast.SourceFile {
 	node := p.finishNode(p.factory.NewSourceFile(p.opts, p.sourceText, p.newNodeList(core.NewTextRange(pos, end), statements), eof), pos)
 	result := node.AsSourceFile()
 	p.finishSourceFile(result, false)
+	// The permissive front-end only approximates Zig semantics, so the synthesized declarations are
+	// emitted but not type-checked. This keeps `--declaration` output meaningful without reporting
+	// cascading errors from the approximation. Set after finishSourceFile so pragma processing does
+	// not clear it.
+	result.CheckJsDirective = &ast.CheckJsDirective{Enabled: false, Range: ast.CommentRange{TextRange: core.NewTextRange(pos, pos)}}
 	collectExternalModuleReferences(result)
 	return result
 }
@@ -95,7 +104,7 @@ func (p *Parser) parseZigTopLevel() []*ast.Node {
 
 	switch p.token {
 	case ast.KindFunctionKeyword:
-		return []*ast.Node{p.parseZigFunction(pos, exported)}
+		return p.parseZigFunction(pos, exported)
 	case ast.KindConstKeyword, ast.KindVarKeyword:
 		return p.parseZigTopLevelBinding(pos, exported)
 	case ast.KindEnumKeyword:
@@ -113,7 +122,7 @@ func (p *Parser) parseZigTopLevel() []*ast.Node {
 
 // parseZigFunction lowers a Zig function declaration. Parameters are captured by name; every type
 // is lowered to `any` and the body is skipped.
-func (p *Parser) parseZigFunction(pos int, exported bool) *ast.Node {
+func (p *Parser) parseZigFunction(pos int, exported bool) []*ast.Node {
 	p.nextToken() // `fn`
 	// Zig identifiers that tokenize as TypeScript keywords (e.g. `and`, `or`, `orelse` are scanned
 	// as operators) still need a usable, unique function name. Synthesize one from the source text
@@ -130,50 +139,13 @@ func (p *Parser) parseZigFunction(pos int, exported bool) *ast.Node {
 		// Include the position so distinct keyword-named functions never collide.
 		name = p.newIdentifierAt("_"+text+"_"+strconv.Itoa(pos), core.NewTextRange(pos, pos))
 	}
-	var params []*ast.Node
-	usedParamNames := map[string]bool{}
-	if p.token == ast.KindOpenParenToken {
-		p.nextToken()
-		for p.token != ast.KindCloseParenToken && p.token != ast.KindEndOfFile {
-			if p.token == ast.KindCommaToken {
-				p.nextToken()
-				continue
-			}
-			before := p.scanner.TokenFullStart()
-			if param := p.parseZigParameter(usedParamNames); param != nil {
-				params = append(params, param)
-			}
-			if p.token == ast.KindCommaToken {
-				p.nextToken()
-			}
-			// Never spin: a parameter that consumed no tokens would otherwise loop forever and
-			// accumulate parameters until the process runs out of memory.
-			if p.scanner.TokenFullStart() == before {
-				p.nextToken()
-			}
-		}
-		if p.token == ast.KindCloseParenToken {
-			p.nextToken()
-		}
-	}
+	params := p.zigParseFunctionParameters()
 	p.zigSkipPostParamModifiers()
-	p.zigSkipReturnType()
-	// Every Zig function is lowered with a body. Functions are never modelled accurately, so the
-	// body only needs to satisfy the checker (a `return undefined` satisfies the "must return a
-	// value" rule, and a synthesized body avoids "function implementation is missing" errors for
-	// `extern` prototypes).
-	bodyStart := p.nodePos()
-	if p.token == ast.KindOpenBraceToken {
-		bodyStart = p.nodePos()
-		p.zigSkipBalanced(ast.KindOpenBraceToken, ast.KindCloseBraceToken)
-	} else if p.token == ast.KindSemicolonToken {
-		p.nextToken()
-	}
-	bodyEnd := p.nodePos()
-	returnStmt := p.finishNodeWithEnd(p.factory.NewReturnStatement(p.zigUndefinedExpression(bodyStart)), bodyStart, bodyStart)
-	body := p.finishNodeWithEnd(p.factory.NewBlock(
-		p.newNodeList(core.NewTextRange(bodyStart, bodyEnd), []*ast.Node{returnStmt}), true,
-	), bodyStart, bodyEnd)
+	// A `fn Name(...) type` factory yields a Zig type; expose it in the type namespace too so uses
+	// such as `Name(T)` in type position resolve.
+	returnsType := p.token == ast.KindTypeKeyword
+	returnType := p.zigParseReturnType(pos)
+	body := p.zigSynthesizeFunctionBody(returnType, p.nodePos())
 
 	result := p.finishNode(p.factory.NewFunctionDeclaration(
 		p.zigExportModifiers(exported, pos),
@@ -181,12 +153,77 @@ func (p *Parser) parseZigFunction(pos int, exported bool) *ast.Node {
 		name,
 		nil,
 		p.newNodeList(core.NewTextRange(pos, p.nodePos()), params),
-		p.zigUnknownTypeAt(p.nodePos()),
+		returnType,
 		nil,
 		body,
 	), pos)
 	p.checkJSSyntax(result)
-	return result
+	if !returnsType {
+		return []*ast.Node{result}
+	}
+	typeAlias := p.finishNode(p.factory.NewTypeAliasDeclaration(
+		p.zigExportModifiers(exported, pos),
+		p.newIdentifierAt(zigTypeAliasName(name.Text()), name.Loc),
+		nil,
+		p.zigUnknownTypeAt(pos),
+	), pos)
+	return []*ast.Node{typeAlias, result}
+}
+
+// zigParseFunctionParameters parses a `( ... )` parameter list, returning the parameter nodes. It
+// never spins: a parameter that consumes no tokens advances the scanner.
+func (p *Parser) zigParseFunctionParameters() []*ast.Node {
+	var params []*ast.Node
+	usedParamNames := map[string]bool{}
+	if p.token != ast.KindOpenParenToken {
+		return params
+	}
+	p.nextToken()
+	for p.token != ast.KindCloseParenToken && p.token != ast.KindEndOfFile {
+		if p.token == ast.KindCommaToken {
+			p.nextToken()
+			continue
+		}
+		before := p.scanner.TokenFullStart()
+		if param := p.parseZigParameter(usedParamNames); param != nil {
+			params = append(params, param)
+		}
+		if p.token == ast.KindCommaToken {
+			p.nextToken()
+		}
+		if p.scanner.TokenFullStart() == before {
+			p.nextToken()
+		}
+	}
+	if p.token == ast.KindCloseParenToken {
+		p.nextToken()
+	}
+	return params
+}
+
+// zigSynthesizeFunctionBody consumes a function body (or a prototype `;`) and returns a block that
+// satisfies the checker: a `throw` for `never`, otherwise a `return` of a value assignable to the
+// declared return type.
+func (p *Parser) zigSynthesizeFunctionBody(returnType *ast.Node, bodyStart int) *ast.Node {
+	if p.token == ast.KindOpenBraceToken {
+		p.zigSkipBalanced(ast.KindOpenBraceToken, ast.KindCloseBraceToken)
+	} else if p.token == ast.KindSemicolonToken {
+		p.nextToken()
+	}
+	bodyEnd := p.nodePos()
+	var bodyStatement *ast.Node
+	switch {
+	case zigTypeIsKeywordNode(returnType, ast.KindNeverKeyword):
+		bodyStatement = p.finishNodeWithEnd(p.factory.NewThrowStatement(p.zigUndefinedExpression(bodyStart)), bodyStart, bodyStart)
+	case zigTypeIsKeywordNode(returnType, ast.KindVoidKeyword), zigTypeIsKeywordNode(returnType, ast.KindUnknownKeyword):
+		bodyStatement = p.finishNodeWithEnd(p.factory.NewReturnStatement(p.newIdentifierAt("undefined", core.NewTextRange(bodyStart, bodyStart))), bodyStart, bodyStart)
+	default:
+		value := p.finishNode(p.factory.NewAsExpression(p.zigUndefinedExpression(bodyStart), returnType), bodyStart)
+		bodyStatement = p.finishNodeWithEnd(p.factory.NewReturnStatement(value), bodyStart, bodyStart)
+	}
+	return p.finishNodeWithEnd(p.factory.NewBlock(
+		p.newNodeList(core.NewTextRange(bodyStart, bodyEnd), []*ast.Node{bodyStatement}), true,
+	), bodyStart, bodyEnd)
 }
 
 // parseZigParameter captures a single parameter. `comptime`/`noalias` modifiers are skipped.
@@ -216,9 +253,10 @@ func (p *Parser) parseZigParameter(used map[string]bool) *ast.Node {
 	if p.zigIsIdent("anytype") || p.token == ast.KindTypeKeyword {
 		p.nextToken()
 	}
+	paramType := p.zigUnknownTypeAt(pos)
 	if p.token == ast.KindColonToken {
 		p.nextToken()
-		p.zigSkipTypeUntil(ast.KindCommaToken, ast.KindCloseParenToken)
+		paramType = p.zigParseParameterType(pos)
 	}
 
 	base := "arg"
@@ -241,7 +279,7 @@ func (p *Parser) parseZigParameter(used map[string]bool) *ast.Node {
 		name = p.newIdentifierAt(final, loc)
 	}
 	return p.finishNode(p.factory.NewParameterDeclaration(
-		nil, nil, name, nil, p.zigUnknownTypeAt(pos), nil,
+		nil, nil, name, nil, paramType, nil,
 	), pos)
 }
 
@@ -260,26 +298,38 @@ func (p *Parser) parseZigTopLevelBinding(pos int, exported bool) []*ast.Node {
 	if nameIsKeyword {
 		name = p.newIdentifierAt("_"+name.Text()+"_"+strconv.Itoa(pos), name.Loc)
 	}
+	declaredType := (*ast.Node)(nil)
 	if p.token == ast.KindColonToken {
 		p.nextToken()
-		p.zigSkipTypeUntil(ast.KindEqualsToken, ast.KindSemicolonToken)
+		declaredType = p.zigTryParseType(pos, func() bool {
+			return p.token == ast.KindEqualsToken || p.token == ast.KindSemicolonToken
+		})
 	}
 	if p.token == ast.KindEqualsToken {
 		p.nextToken()
+		if spec, ok := p.zigTryParseImportExpression(); ok {
+			if p.token == ast.KindSemicolonToken {
+				p.nextToken()
+			}
+			return p.zigImportBindingDeclarations(name, spec, exported, pos)
+		}
+		if container := p.zigTryParseContainer(name, exported, pos); container != nil {
+			return container
+		}
+		if alias := p.zigTryParseQualifiedAlias(name, exported, pos, false); alias != nil {
+			return alias
+		}
 		p.zigSkipValue()
 	} else {
 		p.zigSkipToSemicolon()
 	}
 
-	typeAlias := p.finishNode(p.factory.NewTypeAliasDeclaration(
-		p.zigExportModifiers(exported, pos),
-		p.newIdentifierAt(zigTypeAliasName(name.Text()), name.Loc),
-		nil,
-		p.zigUnknownTypeAt(pos),
-	), pos)
-
+	valueType := declaredType
+	if valueType == nil {
+		valueType = p.zigUnknownTypeAt(pos)
+	}
 	decl := p.finishNode(p.factory.NewVariableDeclaration(
-		p.newIdentifierLike(name), nil, p.zigUnknownTypeAt(pos), p.zigUndefinedExpression(pos),
+		p.newIdentifierLike(name), nil, valueType, p.zigUnknownValueOfType(valueType, pos),
 	), pos)
 	flags := ast.NodeFlagsLet
 	if isConst {
@@ -292,7 +342,104 @@ func (p *Parser) parseZigTopLevelBinding(pos int, exported bool) []*ast.Node {
 		p.zigExportModifiers(exported, pos), declList,
 	), pos)
 
+	// An unannotated binding may be a Zig type alias (`const X = SomeType;`), so also expose it in
+	// the type namespace. Annotated bindings are values (`const x: T = ...`) and get no alias.
+	if declaredType != nil {
+		return []*ast.Node{valueStatement}
+	}
+	typeAlias := p.finishNode(p.factory.NewTypeAliasDeclaration(
+		p.zigExportModifiers(exported, pos),
+		p.newIdentifierAt(zigTypeAliasName(name.Text()), name.Loc),
+		nil,
+		p.zigUnknownTypeAt(pos),
+	), pos)
 	return []*ast.Node{typeAlias, valueStatement}
+}
+
+// zigTryParseImportExpression consumes `@import("spec")` and returns the specifier. On failure the
+// parser is rewound.
+func (p *Parser) zigTryParseImportExpression() (string, bool) {
+	if p.token != ast.KindAtToken {
+		return "", false
+	}
+	state := p.mark()
+	p.nextToken()
+	if !(tokenIsIdentifierOrKeyword(p.token) && p.scanner.TokenValue() == "import") {
+		p.rewind(state)
+		return "", false
+	}
+	p.nextToken()
+	if p.token != ast.KindOpenParenToken {
+		p.rewind(state)
+		return "", false
+	}
+	p.nextToken()
+	if p.token != ast.KindStringLiteral {
+		p.rewind(state)
+		return "", false
+	}
+	spec := p.scanner.TokenValue()
+	p.nextToken()
+	if p.token != ast.KindCloseParenToken {
+		p.rewind(state)
+		return "", false
+	}
+	p.nextToken()
+	return spec, true
+}
+
+// zigTryParseQualifiedAlias recognizes `const X = A.B;` and lowers it to a TypeScript namespace
+// alias (`import X = A.B;`), which preserves both namespace member access (`X.Y`) and type usage
+// for the referenced entity. Only a bare qualified name terminated by the declaration separator is
+// accepted; anything else is rewound.
+func (p *Parser) zigTryParseQualifiedAlias(name *ast.Node, exported bool, pos int, container bool) []*ast.Node {
+	if !tokenIsIdentifierOrKeyword(p.token) {
+		return nil
+	}
+	state := p.mark()
+	entity := p.newIdentifierLike(p.parseIdentifierName())
+	for p.token == ast.KindDotToken {
+		p.nextToken()
+		if !tokenIsIdentifierOrKeyword(p.token) {
+			p.rewind(state)
+			return nil
+		}
+		right := p.parseIdentifierName()
+		entity = p.finishNodeWithEnd(p.factory.NewQualifiedName(entity, p.newIdentifierLike(right)), entity.Pos(), right.End())
+	}
+	if entity.Kind != ast.KindQualifiedName {
+		p.rewind(state)
+		return nil
+	}
+	validEnd := p.token == ast.KindSemicolonToken
+	if container {
+		validEnd = validEnd || p.token == ast.KindCommaToken || p.token == ast.KindCloseBraceToken
+	}
+	if !validEnd {
+		p.rewind(state)
+		return nil
+	}
+	p.parseOptional(ast.KindSemicolonToken)
+	importEquals := p.finishNodeWithEnd(p.factory.NewImportEqualsDeclaration(
+		p.zigExportModifiers(exported, pos), false, p.newIdentifierLike(name), entity,
+	), pos, p.nodePos())
+	return []*ast.Node{importEquals}
+}
+
+// zigImportBindingDeclarations turns `const X = @import("spec")` into a real module import and, when
+// the binding is exported, a matching re-export so `X` remains part of the public surface.
+func (p *Parser) zigImportBindingDeclarations(name *ast.Node, spec string, exported bool, pos int) []*ast.Node {
+	importDecl := p.zigImportDeclaration(name.Text(), spec, pos)
+	if !exported {
+		return []*ast.Node{importDecl}
+	}
+	exportName := p.newIdentifierAt(name.Text(), name.Loc)
+	specifier := p.finishNode(p.factory.NewExportSpecifier(false, nil, exportName), pos)
+	namedExports := p.finishNode(p.factory.NewNamedExports(
+		p.newNodeList(core.NewTextRange(pos, pos), []*ast.Node{specifier}),
+	), pos)
+	exportDecl := p.finishNode(p.factory.NewExportDeclaration(nil, false, namedExports, nil, nil), pos)
+	return []*ast.Node{importDecl, exportDecl}
 }
 
 // parseZigTest skips a `test "name" { ... }` declaration.
@@ -340,6 +487,113 @@ func (p *Parser) zigUndefinedExpression(pos int) *ast.Node {
 	nullExpr := p.factory.NewToken(ast.KindNullKeyword)
 	nullExpr.Loc = core.NewTextRange(pos, pos)
 	return p.finishNode(p.factory.NewAsExpression(nullExpr, p.zigUnknownTypeAt(pos)), pos)
+}
+
+// zigUnknownValueOfType creates a placeholder initializer assignable to the given type without
+// exposing `any`: `null as unknown` when the type is itself permissive, otherwise cast to the type.
+func (p *Parser) zigUnknownValueOfType(typ *ast.Node, pos int) *ast.Node {
+	value := p.zigUndefinedExpression(pos)
+	if typ == nil ||
+		zigTypeIsKeywordNode(typ, ast.KindUnknownKeyword) ||
+		zigTypeIsKeywordNode(typ, ast.KindAnyKeyword) ||
+		zigTypeIsKeywordNode(typ, ast.KindVoidKeyword) {
+		return value
+	}
+	return p.finishNode(p.factory.NewAsExpression(value, typ), pos)
+}
+
+// zigVoidTypeAt creates a `void` keyword type anchored at pos.
+func (p *Parser) zigVoidTypeAt(pos int) *ast.Node {
+	node := p.factory.NewKeywordTypeNode(ast.KindVoidKeyword)
+	node.Loc = core.NewTextRange(pos, pos)
+	return node
+}
+
+// zigTypeIsKeywordNode reports whether the type node is the given keyword type (e.g. `never`).
+func zigTypeIsKeywordNode(node *ast.Node, kind ast.Kind) bool {
+	return node != nil && node.Kind == kind
+}
+
+// zigNormalizeType maps Zig type syntax with no TypeScript equivalent onto `unknown`.
+func (p *Parser) zigNormalizeType(typ *ast.Node, pos int) *ast.Node {
+	if typ != nil && typ.Kind == ast.KindTypeReference {
+		if name := typ.AsTypeReferenceNode().TypeName; name != nil {
+			if name.Kind == ast.KindIdentifier {
+				switch name.Text() {
+				case "error", "anyerror", "anyopaque", "anyframe", "anytype", "type":
+					return p.zigUnknownTypeAt(pos)
+				}
+			} else if name.Kind == ast.KindQualifiedName {
+				switch zigLeftmostName(name) {
+				case "builtin", "root":
+					// Compile-time-only pseudo modules have no declarations to resolve against.
+					return p.zigUnknownTypeAt(pos)
+				}
+			}
+		}
+	}
+	return typ
+}
+
+// zigLeftmostName returns the leftmost identifier of a (possibly qualified) entity name.
+func zigLeftmostName(name *ast.Node) string {
+	for name != nil && name.Kind == ast.KindQualifiedName {
+		name = name.AsQualifiedName().Left
+	}
+	if name != nil && name.Kind == ast.KindIdentifier {
+		return name.Text()
+	}
+	return ""
+}
+
+// zigTryParseType speculatively parses a Zig type using the strict parser's type grammar. It is only
+// accepted when the type is consumed cleanly (no diagnostics) and the parser lands on a token for
+// which isBoundary reports true. Otherwise the parser is rewound and nil is returned. Speculative
+// diagnostics are always discarded so the permissive front-end stays silent.
+func (p *Parser) zigTryParseType(pos int, isBoundary func() bool) *ast.Node {
+	state := p.mark()
+	before := p.scanner.TokenFullStart()
+	candidate := p.parseType()
+	// Named error-union types (`E!T`, `anyerror!T`) leave the `!` behind because `parseType` only
+	// handles the leading-`!` form; keep only the payload type.
+	if p.token == ast.KindExclamationToken {
+		p.nextToken()
+		if payload := p.parseType(); payload != nil {
+			candidate = payload
+		}
+	}
+	if candidate != nil && p.scanner.TokenFullStart() != before && len(p.diagnostics) == state.diagnosticsLen && isBoundary() {
+		return p.zigNormalizeType(candidate, pos)
+	}
+	p.rewind(state)
+	return nil
+}
+
+// zigParseParameterType parses a parameter's type annotation, falling back to `unknown` and skipping
+// the type when it is not modelled.
+func (p *Parser) zigParseParameterType(pos int) *ast.Node {
+	if typ := p.zigTryParseType(pos, func() bool {
+		return p.token == ast.KindCommaToken || p.token == ast.KindCloseParenToken
+	}); typ != nil {
+		return typ
+	}
+	p.zigSkipTypeUntil(ast.KindCommaToken, ast.KindCloseParenToken)
+	return p.zigUnknownTypeAt(pos)
+}
+
+// zigParseReturnType parses a function's return type, defaulting to `void` when omitted and falling
+// back to skipping the type (as `unknown`) when it is not modelled.
+func (p *Parser) zigParseReturnType(pos int) *ast.Node {
+	if p.token == ast.KindOpenBraceToken || p.token == ast.KindSemicolonToken || p.token == ast.KindEndOfFile {
+		return p.zigVoidTypeAt(pos)
+	}
+	if typ := p.zigTryParseType(pos, func() bool {
+		return p.token == ast.KindOpenBraceToken || p.token == ast.KindSemicolonToken || p.token == ast.KindEndOfFile
+	}); typ != nil {
+		return typ
+	}
+	p.zigSkipReturnType()
+	return p.zigUnknownTypeAt(pos)
 }
 
 func (p *Parser) zigEmptyBlockAt(pos int) *ast.Node {

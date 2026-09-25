@@ -37,7 +37,25 @@ func zigBuiltinTypeKind(name string) (ast.Kind, bool) {
 	if zigNumericTypeNames[name] {
 		return ast.KindNumberKeyword, true
 	}
+	// Zig supports arbitrary-width integers and floats: `u1`, `i7`, `f80`, ...
+	if isZigArbitraryWidthNumericType(name) {
+		return ast.KindNumberKeyword, true
+	}
 	return ast.KindUnknown, false
+}
+
+// isZigArbitraryWidthNumericType reports whether name is a Zig numeric type with an explicit bit
+// width, e.g. `u1`, `i7`, `f80`.
+func isZigArbitraryWidthNumericType(name string) bool {
+	if len(name) < 2 || (name[0] != 'u' && name[0] != 'i' && name[0] != 'f') {
+		return false
+	}
+	for i := 1; i < len(name); i++ {
+		if name[i] < '0' || name[i] > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 // zigBuiltinTypeAtCurrent reports the keyword type for the current builtin type name. Qualified names
