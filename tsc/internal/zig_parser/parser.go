@@ -119,6 +119,13 @@ type Parser struct {
 	zigImportExprs    map[*ast.Node]string
 	zigHoistedImports []*ast.Node
 
+	// zigTypeNames and zigValueNames record the top-level names declared in the permissive
+	// front-end and whether they are types/namespaces or values. This lets `const X = A.B` be
+	// lowered as a namespace alias only when `A` is actually a type/namespace; otherwise it is a
+	// value field access.
+	zigTypeNames  map[string]bool
+	zigValueNames map[string]bool
+
 	// zigContextualType holds the declared type of a variable declaration while its initializer is
 	// parsed, so Zig's `.{ ... }` literals can be coerced to that type.
 	zigContextualType *ast.Node
@@ -189,9 +196,14 @@ var zigDialectUnsupportedPatterns = []*regexp.Regexp{
 	regexp.MustCompile(`\berror\s*\{`),                     // error sets `error{ ... }`
 	regexp.MustCompile(`@Vector\b`),                        // `@Vector(...)`
 	regexp.MustCompile(`\bextern\s+(struct|union|enum)\b`), // extern containers
-	regexp.MustCompile(`(?m)^[ \t]*(pub[ \t]+)?const[ \t]+\w+[ \t]*=[ \t]*[@\w"]+(\.[\w"]+)+`),
-	regexp.MustCompile(`[:(]\s*[^,;()\n"]*\b\w+\.\w+`), // qualified type annotations, e.g. `x: std.mem.Allocator`
+	regexp.MustCompile(`[:(]\s*[^,;()\n"]*\b\w+\.\w+`),    // qualified type annotations, e.g. `x: std.mem.Allocator`
 }
+
+// zigImportBindingPattern captures the name of a `const X = @import(...)` binding.
+var zigImportBindingPattern = regexp.MustCompile(`(?m)^[ \t]*(?:pub[ \t]+)?const[ \t]+(\w+)[ \t]*=[ \t]*@import\s*\(`)
+
+// zigQualifiedAliasPattern captures the root of a top-level `const X = A.B...` binding.
+var zigQualifiedAliasPattern = regexp.MustCompile(`(?m)^[ \t]*(?:pub[ \t]+)?const[ \t]+\w+[ \t]*=[ \t]*(\w+)\.\w+`)
 
 // safeParseDialect runs the strict parser and reports whether it produced a diagnostic-free tree.
 func safeParseDialect(opts ast.SourceFileParseOptions, sourceText string, scriptKind core.ScriptKind) (result *ast.SourceFile, ok bool) {
@@ -220,6 +232,22 @@ func safeParseDialect(opts ast.SourceFileParseOptions, sourceText string, script
 func zigDialectUnsupported(sourceText string) bool {
 	for _, pattern := range zigDialectUnsupportedPatterns {
 		if pattern.MatchString(sourceText) {
+			return true
+		}
+	}
+	// `const X = imported.Member;` aliases a declaration from an imported module. The strict parser
+	// lowers them as values, so uses such as `X` in type position fail. Using the imported root
+	// distinguishes these from value field accesses (`const x = instance.field;`), which the strict
+	// parser handles correctly.
+	imports := map[string]bool{}
+	for _, match := range zigImportBindingPattern.FindAllStringSubmatch(sourceText, -1) {
+		imports[match[1]] = true
+	}
+	if len(imports) == 0 {
+		return false
+	}
+	for _, match := range zigQualifiedAliasPattern.FindAllStringSubmatch(sourceText, -1) {
+		if imports[match[1]] {
 			return true
 		}
 	}

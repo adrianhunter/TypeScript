@@ -435,38 +435,36 @@ func (p *Parser) zigSubstituteFactoryTypeNode(node *ast.Node, paramTypes map[str
 	return node
 }
 
-// zigContainerDeclarations builds the `class X` + `interface X` + `module X` triple for a container
-// body. Fields become class properties, `self` methods become interface method signatures, and the
-// remaining members stay in the module namespace.
+// zigContainerDeclarations lowers a container body to a `type X = { ... }` alias plus a TC39 module
+// declaration (`module X { ... }`). Fields and `self` methods describe the instance type; the
+// remaining declarations (functions, nested containers, imports) live in the module, which is what
+// Zig containers actually are (a type and a namespace at the same time).
 func (p *Parser) zigContainerDeclarations(nameNode *ast.Node, body *ast.Node, exported bool, start, end int) []*ast.Node {
 	// Nested containers and enums are desugared before the members are classified.
 	bodyMembers := p.desugarZigStructs(body.AsModuleBlock().Statements.Nodes)
-	var classMembers, interfaceMembers, moduleMembers []*ast.Node
+	var typeMembers, moduleMembers []*ast.Node
 	for _, member := range bodyMembers {
 		if member.Kind == ast.KindPropertyDeclaration {
-			classMembers = append(classMembers, member)
+			property := member.AsPropertyDeclaration()
+			typeMembers = append(typeMembers, p.finishNodeWithEnd(p.factory.NewPropertySignatureDeclaration(
+				nil, property.Name(), nil, property.Type, nil,
+			), member.Pos(), member.End()))
 			continue
 		}
 		moduleMembers = append(moduleMembers, member)
 		if member.Kind == ast.KindFunctionDeclaration {
 			if sig, ok := p.zigMethodSignature(member); ok {
-				interfaceMembers = append(interfaceMembers, sig)
+				typeMembers = append(typeMembers, sig)
 			}
 		}
 	}
 
 	memberLoc := body.AsModuleBlock().Statements.Loc
-	classDecl := p.finishNodeWithEnd(p.factory.NewClassDeclaration(
+	typeAlias := p.finishNodeWithEnd(p.factory.NewTypeAliasDeclaration(
 		p.zigExportModifiers(exported, start),
 		p.newIdentifierLike(nameNode),
-		nil, nil,
-		p.newNodeList(memberLoc, classMembers),
-	), start, end)
-	interfaceDecl := p.finishNodeWithEnd(p.factory.NewInterfaceDeclaration(
-		p.zigExportModifiers(exported, start),
-		p.newIdentifierLike(nameNode),
-		nil, nil,
-		p.newNodeList(memberLoc, interfaceMembers),
+		nil,
+		p.finishNodeWithEnd(p.factory.NewTypeLiteralNode(p.newNodeList(memberLoc, typeMembers)), start, end),
 	), start, end)
 	moduleBlock := p.finishNodeWithEnd(p.factory.NewModuleBlock(
 		p.newNodeList(memberLoc, moduleMembers),
@@ -480,7 +478,7 @@ func (p *Parser) zigContainerDeclarations(nameNode *ast.Node, body *ast.Node, ex
 	), start, end)
 	moduleDecl.Flags |= ast.NodeFlagsModuleFragment
 
-	return []*ast.Node{classDecl, interfaceDecl, moduleDecl}
+	return []*ast.Node{typeAlias, moduleDecl}
 }
 
 // zigEnumDeclarations builds the `type X = "a" | "b"` alias and the `namespace X` value namespace

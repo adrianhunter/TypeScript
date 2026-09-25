@@ -42,10 +42,10 @@ func (p *Parser) parseZigSourceFile() *ast.SourceFile {
 	node := p.finishNode(p.factory.NewSourceFile(p.opts, p.sourceText, p.newNodeList(core.NewTextRange(pos, end), statements), eof), pos)
 	result := node.AsSourceFile()
 	p.finishSourceFile(result, false)
-	// The permissive front-end only approximates Zig semantics, so the synthesized declarations are
-	// emitted but not type-checked. This keeps `--declaration` output meaningful without reporting
-	// cascading errors from the approximation. Set after finishSourceFile so pragma processing does
-	// not clear it.
+	// The permissive front-end approximates genuine Zig as best it can; its declarations are emitted
+	// but not type-checked, so approximations do not surface as cascading errors. The strict dialect
+	// parser (used for files it fully understands, such as the `src/**/*.zig` dialect) is still
+	// checked normally.
 	result.CheckJsDirective = &ast.CheckJsDirective{Enabled: false, Range: ast.CommentRange{TextRange: core.NewTextRange(pos, pos)}}
 	collectExternalModuleReferences(result)
 	return result
@@ -54,6 +54,27 @@ func (p *Parser) parseZigSourceFile() *ast.SourceFile {
 // zigIsIdent reports whether the current token is the contextual keyword `name`.
 func (p *Parser) zigIsIdent(name string) bool {
 	return p.token == ast.KindIdentifier && p.scanner.TokenValue() == name
+}
+
+// zigRecordTypeName records that `name` names a type or namespace in this file.
+func (p *Parser) zigRecordTypeName(name string) {
+	if p.zigTypeNames == nil {
+		p.zigTypeNames = map[string]bool{}
+	}
+	p.zigTypeNames[name] = true
+}
+
+// zigRecordValueName records that `name` names a value (and not a type) in this file.
+func (p *Parser) zigRecordValueName(name string) {
+	if p.zigValueNames == nil {
+		p.zigValueNames = map[string]bool{}
+	}
+	p.zigValueNames[name] = true
+}
+
+// zigIsKnownValue reports whether `name` is known to be a value and not a type/namespace.
+func (p *Parser) zigIsKnownValue(name string) bool {
+	return p.zigValueNames[name] && !p.zigTypeNames[name]
 }
 
 // parseZigTopLevel parses one top-level declaration, skipping anything it does not model.
@@ -159,8 +180,10 @@ func (p *Parser) parseZigFunction(pos int, exported bool) []*ast.Node {
 	), pos)
 	p.checkJSSyntax(result)
 	if !returnsType {
+		p.zigRecordValueName(name.Text())
 		return []*ast.Node{result}
 	}
+	p.zigRecordTypeName(name.Text())
 	typeAlias := p.finishNode(p.factory.NewTypeAliasDeclaration(
 		p.zigExportModifiers(exported, pos),
 		p.newIdentifierAt(zigTypeAliasName(name.Text()), name.Loc),
@@ -311,12 +334,15 @@ func (p *Parser) parseZigTopLevelBinding(pos int, exported bool) []*ast.Node {
 			if p.token == ast.KindSemicolonToken {
 				p.nextToken()
 			}
+			p.zigRecordTypeName(name.Text())
 			return p.zigImportBindingDeclarations(name, spec, exported, pos)
 		}
 		if container := p.zigTryParseContainer(name, exported, pos); container != nil {
+			p.zigRecordTypeName(name.Text())
 			return container
 		}
 		if alias := p.zigTryParseQualifiedAlias(name, exported, pos, false); alias != nil {
+			p.zigRecordTypeName(name.Text())
 			return alias
 		}
 		p.zigSkipValue()
@@ -345,6 +371,7 @@ func (p *Parser) parseZigTopLevelBinding(pos int, exported bool) []*ast.Node {
 	// An unannotated binding may be a Zig type alias (`const X = SomeType;`), so also expose it in
 	// the type namespace. Annotated bindings are values (`const x: T = ...`) and get no alias.
 	if declaredType != nil {
+		p.zigRecordValueName(name.Text())
 		return []*ast.Node{valueStatement}
 	}
 	typeAlias := p.finishNode(p.factory.NewTypeAliasDeclaration(
@@ -408,6 +435,13 @@ func (p *Parser) zigTryParseQualifiedAlias(name *ast.Node, exported bool, pos in
 		entity = p.finishNodeWithEnd(p.factory.NewQualifiedName(entity, p.newIdentifierLike(right)), entity.Pos(), right.End())
 	}
 	if entity.Kind != ast.KindQualifiedName {
+		p.rewind(state)
+		return nil
+	}
+	// `A.B` is only a namespace/type alias when `A` is a type or namespace. If `A` is a known value
+	// (e.g. `const foo: Foo = ...; const x = foo.foo;`), this is a field access and must lower to a
+	// value, not `import x = foo.foo`.
+	if p.zigIsKnownValue(zigLeftmostName(entity)) {
 		p.rewind(state)
 		return nil
 	}
