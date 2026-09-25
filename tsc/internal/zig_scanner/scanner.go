@@ -614,11 +614,13 @@ func (s *Scanner) Scan() ast.Kind {
 			}
 		case '.':
 			next := s.charAt(1)
-			if stringutil.IsDigit(next) {
-				s.token = s.scanNumber()
-			} else if next == '.' && s.charAt(2) == '.' {
+			if next == '.' && s.charAt(2) == '.' {
 				s.pos += 3
 				s.token = ast.KindDotDotDotToken
+			} else if stringutil.IsDigit(next) && (s.pos == 0 || s.text[s.pos-1] != '.') {
+				// A leading `.digit` is a number, but the second dot of Zig's `..` range operator
+				// must not be folded into a numeric literal (e.g. `0b1010..0b1111`).
+				s.token = s.scanNumber()
 			} else {
 				s.pos++
 				s.token = ast.KindDotToken
@@ -709,7 +711,37 @@ func (s *Scanner) Scan() ast.Kind {
 			if s.charAt(1) == 'X' || s.charAt(1) == 'x' {
 				start := s.pos
 				s.pos += 2
-				digits := s.scanHexDigits(1, true, true)
+				intDigits := s.scanHexDigits(0, true, true)
+				hasFraction := false
+				// A `..` after the digits is Zig's range operator, not a fractional part.
+				if s.char() == '.' && s.charAt(1) != '.' {
+					hasFraction = true
+					s.pos++
+					s.scanHexDigits(0, true, true)
+				}
+				hasExponent := false
+				if s.char() == 'p' || s.char() == 'P' {
+					hasExponent = true
+					s.pos++
+					if s.char() == '+' || s.char() == '-' {
+						s.pos++
+					}
+					expStart := s.pos
+					s.scanASCIIWhile(func(b byte) bool {
+						return b >= '0' && b <= '9'
+					})
+					if s.pos == expStart {
+						s.errorAt(diagnostics.Digit_expected, s.pos, 0)
+					}
+				}
+				if hasFraction || hasExponent {
+					// Zig hexadecimal floating point literal (e.g. `0x1.f9d74cp-2`).
+					s.tokenValue = s.text[start:s.pos]
+					s.tokenFlags |= ast.TokenFlagsHexSpecifier
+					s.token = ast.KindNumericLiteral
+					break
+				}
+				digits := intDigits
 				if digits == "" {
 					s.error(diagnostics.Hexadecimal_digit_expected)
 					digits = "0"
@@ -898,6 +930,19 @@ func (s *Scanner) Scan() ast.Kind {
 			s.pos++
 			s.token = ast.KindAtToken
 		case '\\':
+			// Zig multiline string literal: each line begins with `\\` (possibly indented) and
+			// runs to the end of the line. Lex the line as a string so the rest of the text is not
+			// mistaken for punctuation or invalid characters.
+			if s.charAt(1) == '\\' {
+				s.pos += 2
+				lineStart := s.pos
+				for ch, size := s.charAndSize(); size > 0 && !stringutil.IsLineBreak(ch); ch, size = s.charAndSize() {
+					s.pos += size
+				}
+				s.tokenValue = s.text[lineStart:s.pos]
+				s.token = ast.KindStringLiteral
+				break
+			}
 			if s.scanIdentifier(0, identifierVariantStandard) {
 				s.token = GetIdentifierToken(s.tokenValue)
 			} else {
@@ -1980,7 +2025,8 @@ func (s *Scanner) scanNumber() ast.Kind {
 	fractionalPart := ""
 	exponentPreamble := ""
 	exponentPart := ""
-	if s.char() == '.' {
+	// Do not treat the first dot of Zig's `...`/`..` range operators as a decimal point.
+	if s.char() == '.' && s.charAt(1) != '.' {
 		s.pos++
 		fractionalPart = s.scanNumberFragment()
 	}

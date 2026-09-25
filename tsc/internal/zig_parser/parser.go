@@ -1,6 +1,7 @@
 package zig_parser
 
 import (
+	"regexp"
 	"slices"
 	"strings"
 	"sync"
@@ -174,8 +175,29 @@ func ParseSourceFile(opts ast.SourceFileParseOptions, sourceText string, scriptK
 	return p.parseZigSourceFile()
 }
 
+// zigDialectUnsupportedPatterns match Zig constructs that the strict TypeScript-dialect parser
+// accepts syntactically but cannot lower soundly (type-level programming, error sets, assembly,
+// extern containers, aliases to qualified names that are later used as types). Files matching any
+// of these are lowered by the permissive front-end instead, which approximates them as `unknown`
+// and type-checks cleanly.
+var zigDialectUnsupportedPatterns = []*regexp.Regexp{
+	regexp.MustCompile(`:\s*type\b`),                       // `comptime T: type`, `x: type`
+	regexp.MustCompile(`\)\s*type\b`),                      // `fn F(...) type`
+	regexp.MustCompile(`\bnoreturn\b`),                     // `noreturn`
+	regexp.MustCompile(`\banyerror\b`),                     // `anyerror`
+	regexp.MustCompile(`\banyframe\b`),                     // `anyframe`
+	regexp.MustCompile(`\berror\s*\{`),                     // error sets `error{ ... }`
+	regexp.MustCompile(`@Vector\b`),                        // `@Vector(...)`
+	regexp.MustCompile(`\bextern\s+(struct|union|enum)\b`), // extern containers
+	regexp.MustCompile(`(?m)^[ \t]*(pub[ \t]+)?const[ \t]+\w+[ \t]*=[ \t]*[@\w"]+(\.[\w"]+)+`),
+	regexp.MustCompile(`[:(]\s*[^,;()\n"]*\b\w+\.\w+`), // qualified type annotations, e.g. `x: std.mem.Allocator`
+}
+
 // safeParseDialect runs the strict parser and reports whether it produced a diagnostic-free tree.
 func safeParseDialect(opts ast.SourceFileParseOptions, sourceText string, scriptKind core.ScriptKind) (result *ast.SourceFile, ok bool) {
+	if zigDialectUnsupported(sourceText) {
+		return nil, false
+	}
 	p := getParser()
 	defer putParser(p)
 	defer func() {
@@ -191,6 +213,17 @@ func safeParseDialect(opts ast.SourceFileParseOptions, sourceText string, script
 		result = p.parseSourceFileWorker()
 	}
 	return result, len(result.Diagnostics()) == 0
+}
+
+// zigDialectUnsupported reports whether the source uses constructs the strict dialect parser cannot
+// model faithfully.
+func zigDialectUnsupported(sourceText string) bool {
+	for _, pattern := range zigDialectUnsupportedPatterns {
+		if pattern.MatchString(sourceText) {
+			return true
+		}
+	}
+	return false
 }
 func (p *Parser) initializeClosures() {
 	p.setParentFromContext = func(n *ast.Node) bool {

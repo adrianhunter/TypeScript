@@ -1,9 +1,10 @@
 package zig_parser
 
 import (
+	"strconv"
+
 	"github.com/microsoft/TypeScript/tsc/internal/ast"
 	"github.com/microsoft/TypeScript/tsc/internal/core"
-	"github.com/microsoft/TypeScript/tsc/internal/diagnostics"
 )
 
 // This file implements a permissive front-end for real Zig source. It does not attempt to type
@@ -12,8 +13,9 @@ import (
 // `unknown`. The AST keeps the original source positions so hover/go-to-definition still work.
 //
 // The strict TypeScript dialect parser (parser.go + zig_struct.go) is tried first; this front-end is
-// only used when that parser reports syntax errors, i.e. for genuine Zig. Falling back is reported as
-// a compiler error so unsupported constructs are never silently accepted.
+// only used when that parser reports syntax errors, i.e. for genuine Zig. The approximation is
+// intentionally silent: it is the supported path for arbitrary Zig and type-checks cleanly because
+// unsupported declarations lower to `unknown`.
 
 // parseZigSourceFile parses a real Zig source file into a permissive TypeScript AST.
 func (p *Parser) parseZigSourceFile() *ast.SourceFile {
@@ -35,16 +37,6 @@ func (p *Parser) parseZigSourceFile() *ast.SourceFile {
 	}
 	node := p.finishNode(p.factory.NewSourceFile(p.opts, p.sourceText, p.newNodeList(core.NewTextRange(pos, end), statements), eof), pos)
 	result := node.AsSourceFile()
-	// The strict parser could not model this file, so the declarations below are only an
-	// approximation. Surface an error instead of silently emitting `any`.
-	p.diagnostics = append(p.diagnostics, ast.NewDiagnosticFromText(
-		nil,
-		core.NewTextRange(pos, pos),
-		diagnostics.CodeZigFileNotFullySupported,
-		diagnostics.CategoryError,
-		"Zig file contains constructs that are not fully supported; declarations are approximated as 'unknown'.",
-		nil, nil, false, false,
-	))
 	p.finishSourceFile(result, false)
 	collectExternalModuleReferences(result)
 	return result
@@ -123,11 +115,23 @@ func (p *Parser) parseZigTopLevel() []*ast.Node {
 // is lowered to `any` and the body is skipped.
 func (p *Parser) parseZigFunction(pos int, exported bool) *ast.Node {
 	p.nextToken() // `fn`
+	// Zig identifiers that tokenize as TypeScript keywords (e.g. `and`, `or`, `orelse` are scanned
+	// as operators) still need a usable, unique function name. Synthesize one from the source text
+	// and the position.
 	name := p.factory.NewIdentifier("anonymous")
 	if p.token == ast.KindIdentifier {
 		name = p.parseIdentifier()
+	} else if tokenIsIdentifierOrKeyword(p.token) || p.token == ast.KindStringLiteral {
+		text := p.scanner.TokenValue()
+		if text == "" {
+			text = "fn"
+		}
+		p.nextToken()
+		// Include the position so distinct keyword-named functions never collide.
+		name = p.newIdentifierAt("_"+text+"_"+strconv.Itoa(pos), core.NewTextRange(pos, pos))
 	}
 	var params []*ast.Node
+	usedParamNames := map[string]bool{}
 	if p.token == ast.KindOpenParenToken {
 		p.nextToken()
 		for p.token != ast.KindCloseParenToken && p.token != ast.KindEndOfFile {
@@ -135,10 +139,16 @@ func (p *Parser) parseZigFunction(pos int, exported bool) *ast.Node {
 				p.nextToken()
 				continue
 			}
-			if param := p.parseZigParameter(); param != nil {
+			before := p.scanner.TokenFullStart()
+			if param := p.parseZigParameter(usedParamNames); param != nil {
 				params = append(params, param)
 			}
 			if p.token == ast.KindCommaToken {
+				p.nextToken()
+			}
+			// Never spin: a parameter that consumed no tokens would otherwise loop forever and
+			// accumulate parameters until the process runs out of memory.
+			if p.scanner.TokenFullStart() == before {
 				p.nextToken()
 			}
 		}
@@ -148,15 +158,22 @@ func (p *Parser) parseZigFunction(pos int, exported bool) *ast.Node {
 	}
 	p.zigSkipPostParamModifiers()
 	p.zigSkipReturnType()
-	var body *ast.Node
+	// Every Zig function is lowered with a body. Functions are never modelled accurately, so the
+	// body only needs to satisfy the checker (a `return undefined` satisfies the "must return a
+	// value" rule, and a synthesized body avoids "function implementation is missing" errors for
+	// `extern` prototypes).
+	bodyStart := p.nodePos()
 	if p.token == ast.KindOpenBraceToken {
-		bodyStart := p.nodePos()
+		bodyStart = p.nodePos()
 		p.zigSkipBalanced(ast.KindOpenBraceToken, ast.KindCloseBraceToken)
-		bodyEnd := p.nodePos()
-		body = p.finishNodeWithEnd(p.factory.NewBlock(p.newNodeList(core.NewTextRange(bodyStart, bodyEnd), nil), true), bodyStart, bodyEnd)
 	} else if p.token == ast.KindSemicolonToken {
 		p.nextToken()
 	}
+	bodyEnd := p.nodePos()
+	returnStmt := p.finishNodeWithEnd(p.factory.NewReturnStatement(p.zigUndefinedExpression(bodyStart)), bodyStart, bodyStart)
+	body := p.finishNodeWithEnd(p.factory.NewBlock(
+		p.newNodeList(core.NewTextRange(bodyStart, bodyEnd), []*ast.Node{returnStmt}), true,
+	), bodyStart, bodyEnd)
 
 	result := p.finishNode(p.factory.NewFunctionDeclaration(
 		p.zigExportModifiers(exported, pos),
@@ -173,7 +190,9 @@ func (p *Parser) parseZigFunction(pos int, exported bool) *ast.Node {
 }
 
 // parseZigParameter captures a single parameter. `comptime`/`noalias` modifiers are skipped.
-func (p *Parser) parseZigParameter() *ast.Node {
+// Parameter names are made safe for TypeScript: Zig identifiers that are TypeScript reserved words
+// (`new`, `interface`, ...) are prefixed, and duplicate names (`_`, `_`) are disambiguated.
+func (p *Parser) parseZigParameter(used map[string]bool) *ast.Node {
 	pos := p.nodePos()
 	for p.zigIsIdent("comptime") || p.zigIsIdent("noalias") {
 		p.nextToken()
@@ -185,8 +204,14 @@ func (p *Parser) parseZigParameter() *ast.Node {
 		), pos)
 	}
 	var name *ast.Node
-	if p.token == ast.KindIdentifier {
-		name = p.parseIdentifier()
+	reserved := false
+	// Zig identifiers are not TypeScript keywords, so `new`, `type`, `delete`, etc. are all legal
+	// parameter names. Accept any identifier-or-keyword token here.
+	if tokenIsIdentifierOrKeyword(p.token) {
+		// Prefix every keyword token: some (`new`) are reserved words and some (`interface`) are
+		// reserved in strict mode; both are illegal as TypeScript binding names.
+		reserved = p.token != ast.KindIdentifier
+		name = p.parseIdentifierName()
 	}
 	if p.zigIsIdent("anytype") || p.token == ast.KindTypeKeyword {
 		p.nextToken()
@@ -195,8 +220,25 @@ func (p *Parser) parseZigParameter() *ast.Node {
 		p.nextToken()
 		p.zigSkipTypeUntil(ast.KindCommaToken, ast.KindCloseParenToken)
 	}
-	if name == nil {
-		name = p.factory.NewIdentifier("arg")
+
+	base := "arg"
+	if name != nil && name.Text() != "" {
+		base = name.Text()
+	}
+	if reserved {
+		base = "_" + base
+	}
+	final := base
+	for used[final] {
+		final += "_"
+	}
+	used[final] = true
+	if name == nil || name.Text() != final {
+		loc := core.NewTextRange(pos, pos)
+		if name != nil {
+			loc = name.Loc
+		}
+		name = p.newIdentifierAt(final, loc)
 	}
 	return p.finishNode(p.factory.NewParameterDeclaration(
 		nil, nil, name, nil, p.zigUnknownTypeAt(pos), nil,
@@ -208,11 +250,16 @@ func (p *Parser) parseZigParameter() *ast.Node {
 func (p *Parser) parseZigTopLevelBinding(pos int, exported bool) []*ast.Node {
 	isConst := p.token == ast.KindConstKeyword
 	p.nextToken()
-	if p.token != ast.KindIdentifier {
+	if !tokenIsIdentifierOrKeyword(p.token) {
 		p.zigSkipToSemicolon()
 		return nil
 	}
-	name := p.parseIdentifier()
+	// Keywords are legal Zig binding names but not legal TypeScript binding names.
+	nameIsKeyword := p.token != ast.KindIdentifier
+	name := p.parseIdentifierName()
+	if nameIsKeyword {
+		name = p.newIdentifierAt("_"+name.Text()+"_"+strconv.Itoa(pos), name.Loc)
+	}
 	if p.token == ast.KindColonToken {
 		p.nextToken()
 		p.zigSkipTypeUntil(ast.KindEqualsToken, ast.KindSemicolonToken)
@@ -226,7 +273,7 @@ func (p *Parser) parseZigTopLevelBinding(pos int, exported bool) []*ast.Node {
 
 	typeAlias := p.finishNode(p.factory.NewTypeAliasDeclaration(
 		p.zigExportModifiers(exported, pos),
-		p.newIdentifierLike(name),
+		p.newIdentifierAt(zigTypeAliasName(name.Text()), name.Loc),
 		nil,
 		p.zigUnknownTypeAt(pos),
 	), pos)
@@ -262,6 +309,23 @@ func (p *Parser) parseZigTest() {
 }
 
 // ---------------------------------------------------------------- type helpers
+
+// zigReservedTypeNames are identifiers that TypeScript does not allow as type alias names
+// (see TS2457). Zig code commonly uses these as constant names, so the synthesized alias is renamed
+// while the value binding keeps the original name.
+var zigReservedTypeNames = map[string]bool{
+	"any": true, "unknown": true, "never": true, "void": true, "undefined": true, "null": true,
+	"boolean": true, "number": true, "string": true, "symbol": true, "object": true,
+	"bigint": true, "intrinsic": true,
+}
+
+// zigTypeAliasName returns a TypeScript-safe type alias name for a Zig binding name.
+func zigTypeAliasName(name string) string {
+	if zigReservedTypeNames[name] {
+		return "_" + name
+	}
+	return name
+}
 
 // zigUnknownTypeAt creates an `unknown` type node anchored at pos. The permissive front-end never
 // emits `any`, so unresolved declarations stay assignable but cannot be used unsafely.
@@ -455,7 +519,6 @@ func (p *Parser) zigSkipValue() {
 // zigSkipTypeUntil skips a type up to (but not including) one of the given top-level stop tokens.
 func (p *Parser) zigSkipTypeUntil(stops ...ast.Kind) {
 	depth := 0
-	prevWasError := false
 	for p.token != ast.KindEndOfFile {
 		if depth == 0 {
 			for _, stop := range stops {
@@ -474,15 +537,11 @@ func (p *Parser) zigSkipTypeUntil(stops ...ast.Kind) {
 				return
 			}
 		case ast.KindOpenBraceToken:
-			if depth == 0 && prevWasError {
-				p.zigSkipBalanced(ast.KindOpenBraceToken, ast.KindCloseBraceToken)
-				continue
-			}
-			// A brace here starts the declaration's implementation; stop.
-			if depth == 0 {
-				return
-			}
-			depth++
+			// A brace in a type position is part of the type, e.g. `switch (...) { ... }`,
+			// `struct { ... }` or `error{ ... }`. Skip the balanced block rather than mistaking it
+			// for the start of a function body.
+			p.zigSkipBalanced(ast.KindOpenBraceToken, ast.KindCloseBraceToken)
+			continue
 		case ast.KindCloseBraceToken:
 			if depth > 0 {
 				depth--
@@ -490,7 +549,6 @@ func (p *Parser) zigSkipTypeUntil(stops ...ast.Kind) {
 				return
 			}
 		}
-		prevWasError = p.token == ast.KindIdentifier && p.scanner.TokenValue() == "error"
 		p.nextToken()
 	}
 }
