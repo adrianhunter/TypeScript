@@ -1858,7 +1858,15 @@ func (p *Printer) emitObjectLiteralElement(node *ast.ObjectLiteralElement) {
 	case ast.KindSetAccessor:
 		p.emitSetAccessorDeclaration(node.AsSetAccessorDeclaration())
 	default:
-		panic(fmt.Sprintf("unhandled ObjectLiteralElement: %v", node.Kind))
+		fileName := "<unknown>"
+		if p.currentSourceFile != nil {
+			fileName = p.currentSourceFile.FileName()
+		}
+		parentKind := ast.KindUnknown
+		if node.Parent != nil {
+			parentKind = node.Parent.Kind
+		}
+		panic(fmt.Sprintf("unhandled ObjectLiteralElement: %v at %s:%d (parent %v)", node.Kind, fileName, node.Pos(), parentKind))
 	}
 }
 

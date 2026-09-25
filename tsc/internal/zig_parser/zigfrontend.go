@@ -83,6 +83,26 @@ func (p *Parser) zigIsKnownValue(name string) bool {
 	return p.zigValueNames[name] && !p.zigTypeNames[name]
 }
 
+// zigBindingMayBeType reports whether an unannotated binding's initializer could be a type expression,
+// in which case the binding is also exposed in the type namespace. Values with complex initializers
+// (calls, container literals, literals, ...) are values only and must not get a bogus `unknown` alias.
+func (p *Parser) zigBindingMayBeType(valueExpr *ast.Node) bool {
+	if valueExpr == nil {
+		return false
+	}
+	switch valueExpr.Kind {
+	case ast.KindIdentifier:
+		return !p.zigIsKnownValue(valueExpr.Text())
+	case ast.KindPropertyAccessExpression:
+		left := valueExpr
+		for left.Kind == ast.KindPropertyAccessExpression {
+			left = left.AsPropertyAccessExpression().Expression
+		}
+		return left.Kind == ast.KindIdentifier && p.zigTypeNames[left.Text()] && !p.zigIsKnownValue(left.Text())
+	}
+	return false
+}
+
 // parseZigTopLevel parses one top-level declaration, skipping anything it does not model.
 func (p *Parser) parseZigTopLevel() []*ast.Node {
 	pos := p.nodePos()
@@ -396,8 +416,9 @@ func (p *Parser) parseZigTopLevelBinding(pos int, exported bool) []*ast.Node {
 	), pos, end)
 
 	// An unannotated binding may be a Zig type alias (`const X = SomeType;`), so also expose it in
-	// the type namespace. Annotated bindings are values (`const x: T = ...`) and get no alias.
-	if declaredType != nil {
+	// the type namespace. Annotated bindings, and bindings whose initializer is clearly a value, are
+	// values only and get no alias.
+	if declaredType != nil || !p.zigBindingMayBeType(valueExpr) {
 		p.zigRecordValueName(name.Text())
 		return []*ast.Node{valueStatement}
 	}

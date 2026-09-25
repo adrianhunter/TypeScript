@@ -20,7 +20,7 @@ func (p *Parser) parseZigDotExpression() *ast.Expression {
 	if p.token == ast.KindOpenBraceToken {
 		return p.parseZigContainerLiteral(pos)
 	}
-	name := p.parseIdentifierName()
+	name := p.parseZigIdentifierName()
 	if p.opts.SkipZigDesugar {
 		// Formatting parse: keep the `.name` literal's source range so spacing is preserved.
 		result := p.newIdentifierLike(name)
@@ -35,6 +35,21 @@ func (p *Parser) parseZigDotExpression() *ast.Expression {
 		}
 	}
 	return p.finishNode(p.factory.NewStringLiteral(name.Text(), ast.TokenFlagsNone), pos)
+}
+
+// parseZigIdentifierName parses a Zig identifier, including the quoted `@"name"` form.
+func (p *Parser) parseZigIdentifierName() *ast.Node {
+	if p.token != ast.KindAtToken {
+		return p.parseIdentifierName()
+	}
+	pos := p.nodePos()
+	p.nextToken() // '@'
+	text := ""
+	if p.token == ast.KindStringLiteral || p.token == ast.KindNoSubstitutionTemplateLiteral {
+		text = p.scanner.TokenValue()
+		p.nextToken()
+	}
+	return p.newIdentifierAt(text, core.NewTextRange(pos, p.nodePos()))
 }
 
 // entityNameToExpression converts a (qualified) type name such as `Shape.Kind` into the equivalent
@@ -109,26 +124,34 @@ func (p *Parser) parseZigContainerLiteral(pos int) *ast.Expression {
 func (p *Parser) parseZigLiteralElement() *ast.Node {
 	if p.token == ast.KindDotToken {
 		if p.lookAhead((*Parser).zigLiteralIsFieldAssignment) {
+			pos := p.nodePos()
 			dotStart := p.scanner.TokenStart()
 			p.nextToken() // '.'
-			name := p.parseIdentifierName()
-			// Extend the name over the leading dot so the language service sees `{` / `,` as the token
-			// preceding the member name and offers the container's fields.
-			name.Loc = core.NewTextRange(dotStart, name.End())
+			name := p.parseZigIdentifierName()
+			start := pos
+			if !p.opts.SkipZigDesugar {
+				// Extend the name over the leading dot so the language service sees `{` / `,` as the
+				// token preceding the member name and offers the container's fields. The formatting
+				// parse keeps token-accurate ranges instead.
+				name.Loc = core.NewTextRange(dotStart, name.End())
+				start = dotStart
+			}
 			p.nextToken() // '='
 			value := p.parseAssignmentExpressionOrHigher()
-			return p.finishNode(p.factory.NewPropertyAssignment(nil, name, nil, nil, value), dotStart)
+			return p.finishNode(p.factory.NewPropertyAssignment(nil, name, nil, nil, value), start)
 		}
 		// `.name` / `.` (before the `=` is typed) in a struct literal: keep it an object-literal
-		// member so the language service offers the contextual type's fields. Array literals keep
-		// their previous handling.
-		if p.zigContextualType != nil && p.zigContextualType.Kind != ast.KindArrayType {
+		// member so the language service offers the contextual type's fields. `.{ ... }` is a nested
+		// anonymous container literal, and array literals keep their previous handling.
+		if !p.opts.SkipZigDesugar &&
+			!p.lookAhead((*Parser).zigLiteralIsNestedContainer) &&
+			p.zigContextualType != nil && p.zigContextualType.Kind != ast.KindArrayType {
 			dotStart := p.scanner.TokenStart()
 			dotEnd := p.scanner.TokenEnd()
 			p.nextToken() // '.'
 			var name *ast.Node
-			if p.token == ast.KindIdentifier {
-				name = p.parseIdentifierName()
+			if p.token == ast.KindIdentifier || p.token == ast.KindAtToken {
+				name = p.parseZigIdentifierName()
 				// Extend the name over the leading dot so `.name` reads as a single member token and
 				// completion triggers right after the dot.
 				name.Loc = core.NewTextRange(dotStart, name.End())
@@ -146,7 +169,21 @@ func (p *Parser) parseZigLiteralElement() *ast.Node {
 
 // zigLiteralIsFieldAssignment reports whether the upcoming `.<name> =` starts a field initializer.
 func (p *Parser) zigLiteralIsFieldAssignment() bool {
-	return p.nextToken() == ast.KindIdentifier && p.nextToken() == ast.KindEqualsToken
+	switch p.nextToken() {
+	case ast.KindAtToken:
+		if p.nextToken() != ast.KindStringLiteral && p.token != ast.KindNoSubstitutionTemplateLiteral {
+			return false
+		}
+		return p.nextToken() == ast.KindEqualsToken
+	case ast.KindIdentifier:
+		return p.nextToken() == ast.KindEqualsToken
+	}
+	return false
+}
+
+// zigLiteralIsNestedContainer reports whether the upcoming `.` starts a `.{ ... }` container literal.
+func (p *Parser) zigLiteralIsNestedContainer() bool {
+	return p.nextToken() == ast.KindOpenBraceToken
 }
 
 // parseZigContainerMember parses a single member of a Zig container body. Fields
