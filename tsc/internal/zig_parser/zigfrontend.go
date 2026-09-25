@@ -381,6 +381,16 @@ func (p *Parser) parseZigTopLevelBinding(pos int, exported bool) []*ast.Node {
 		if valueExpr == nil {
 			p.zigSkipValue()
 		}
+		// Remember bindings backed by `@typeInfo`, which are modeled as the tagged `Type` union
+		// (`{ tag; data }`) so a `switch` over them can be lowered with tag/data narrowing.
+		if valueExpr != nil && valueExpr.Kind == ast.KindCallExpression {
+			if callee := valueExpr.AsCallExpression().Expression; callee != nil && callee.Kind == ast.KindIdentifier && callee.Text() == "typeInfo" {
+				if p.zigTypeInfoNames == nil {
+					p.zigTypeInfoNames = map[string]bool{}
+				}
+				p.zigTypeInfoNames[name.Text()] = true
+			}
+		}
 	} else {
 		p.zigSkipToSemicolon()
 	}
@@ -593,6 +603,9 @@ func (p *Parser) zigUnknownValueOfType(typ *ast.Node, pos int) *ast.Node {
 // (such as a trailing `.` while typing) are kept even though they produce a parse diagnostic, which
 // is discarded. Returns nil (and rewinds) otherwise.
 func (p *Parser) zigTryParseValueExpression() *ast.Node {
+	if expression := p.zigTryParseSwitchExpression(); expression != nil {
+		return expression
+	}
 	if expression := p.zigTryParseGenericValueExpression(); expression != nil {
 		return expression
 	}
@@ -600,6 +613,172 @@ func (p *Parser) zigTryParseValueExpression() *ast.Node {
 	// name). Fall back to a line-aware member access so `foo.` while typing still yields a property
 	// access node for the language service.
 	return p.zigTryParseTrailingMemberAccess()
+}
+
+// zigNeverExpression creates an expression of type `never`, used to lower Zig's `unreachable`.
+func (p *Parser) zigNeverExpression(pos int) *ast.Node {
+	nullExpr := p.factory.NewToken(ast.KindNullKeyword)
+	nullExpr.Loc = core.NewTextRange(pos, pos)
+	neverType := p.factory.NewKeywordTypeNode(ast.KindNeverKeyword)
+	neverType.Loc = core.NewTextRange(pos, pos)
+	return p.finishNodeWithEnd(p.factory.NewAsExpression(nullExpr, neverType), pos, pos)
+}
+
+// zigSwitchPayload builds a fresh payload access for a switch arm. `@typeInfo` results are modeled as
+// the tagged `Type` union (`{ tag; data }`), so their payload is `subject.data`.
+func (p *Parser) zigSwitchPayload(subject *ast.Node, tag string, typeInfo bool, pos int) *ast.Node {
+	subj := p.factory.DeepCloneReparse(subject)
+	prop := tag
+	if typeInfo {
+		prop = "data"
+	}
+	return p.finishNode(p.factory.NewPropertyAccessExpression(subj, nil, p.newIdentifier(prop), ast.NodeFlagsNone), pos)
+}
+
+// zigSwitchCondition builds the condition that selects a switch arm. The tagged `Type` union is
+// discriminated by `tag`; user unions expose each variant as a field of the same name.
+func (p *Parser) zigSwitchCondition(subject *ast.Node, tag string, typeInfo bool, pos int) *ast.Node {
+	subj := p.factory.DeepCloneReparse(subject)
+	if typeInfo {
+		tagAccess := p.finishNode(p.factory.NewPropertyAccessExpression(subj, nil, p.newIdentifier("tag"), ast.NodeFlagsNone), pos)
+		literal := p.factory.NewStringLiteral(tag, ast.TokenFlagsNone)
+		literal.Loc = core.NewTextRange(pos, pos)
+		return p.finishNode(p.factory.NewBinaryExpression(nil, tagAccess, nil, p.factory.NewToken(ast.KindEqualsEqualsEqualsToken), literal), pos)
+	}
+	payload := p.finishNode(p.factory.NewPropertyAccessExpression(subj, nil, p.newIdentifier(tag), ast.NodeFlagsNone), pos)
+	unknownPayload := p.finishNodeWithEnd(p.factory.NewAsExpression(payload, p.zigUnknownTypeAt(pos)), pos, pos)
+	return p.finishNode(p.factory.NewBinaryExpression(
+		nil,
+		unknownPayload,
+		nil,
+		p.factory.NewToken(ast.KindExclamationEqualsEqualsToken),
+		p.newIdentifier("undefined"),
+	), pos)
+}
+
+// zigLowerSwitchArm lowers one switch arm body. `unreachable` becomes a `never` expression, and a
+// `|capture|` payload is bound through an immediately-invoked arrow so the body keeps a real type.
+func (p *Parser) zigLowerSwitchArm(body *ast.Node, subject *ast.Node, capture, tag string, typeInfo bool, pos int) *ast.Node {
+	if body == nil {
+		return nil
+	}
+	if body.Kind == ast.KindIdentifier && body.Text() == "unreachable" {
+		return p.zigNeverExpression(pos)
+	}
+	if capture == "" || tag == "" {
+		return body
+	}
+	if body.Kind == ast.KindIdentifier && body.Text() == capture {
+		return p.zigSwitchPayload(subject, tag, typeInfo, pos)
+	}
+	payload := p.zigSwitchPayload(subject, tag, typeInfo, pos)
+	param := p.finishNode(p.factory.NewParameterDeclaration(nil, nil, p.newIdentifier(capture), nil, nil, nil), pos)
+	params := p.newNodeList(core.NewTextRange(pos, pos), []*ast.Node{param})
+	arrowToken := p.factory.NewToken(ast.KindEqualsGreaterThanToken)
+	arrowToken.Loc = core.NewTextRange(pos, pos)
+	arrow := p.finishNode(p.factory.NewArrowFunction(nil, nil, params, nil, nil, arrowToken, body), pos)
+	paren := p.finishNode(p.factory.NewParenthesizedExpression(arrow), pos)
+	return p.finishNode(p.factory.NewCallExpression(paren, nil, nil, p.newNodeList(core.NewTextRange(pos, pos), []*ast.Node{payload}), ast.NodeFlagsNone), pos)
+}
+
+// zigTryParseSwitchExpression parses `switch (subject) { .tag => |cap| body, ..., else => body }` and
+// lowers it to a conditional expression so a binding keeps a real inferred type instead of `unknown`.
+func (p *Parser) zigTryParseSwitchExpression() *ast.Node {
+	if p.token != ast.KindSwitchKeyword {
+		return nil
+	}
+	state := p.mark()
+	pos := p.nodePos()
+	p.nextToken() // switch
+	if p.token != ast.KindOpenParenToken {
+		p.rewind(state)
+		return nil
+	}
+	p.nextToken()
+	subject := p.parseAssignmentExpressionOrHigher()
+	if subject == nil || p.token != ast.KindCloseParenToken {
+		p.rewind(state)
+		return nil
+	}
+	subjectIsTypeInfo := subject.Kind == ast.KindIdentifier && p.zigTypeInfoNames[subject.Text()]
+	p.nextToken()
+	if p.token != ast.KindOpenBraceToken {
+		p.rewind(state)
+		return nil
+	}
+	p.nextToken()
+
+	type switchArm struct {
+		tag    string
+		body   *ast.Node
+		isElse bool
+	}
+	var arms []switchArm
+	for p.token != ast.KindCloseBraceToken && p.token != ast.KindEndOfFile {
+		if p.parseOptional(ast.KindCommaToken) {
+			continue
+		}
+		var arm switchArm
+		switch {
+		case p.token == ast.KindElseKeyword:
+			arm.isElse = true
+			p.nextToken()
+		case p.token == ast.KindDotToken:
+			p.nextToken()
+			if p.token != ast.KindIdentifier && p.token != ast.KindAtToken {
+				p.rewind(state)
+				return nil
+			}
+			arm.tag = p.parseZigIdentifierName().Text()
+		default:
+			p.rewind(state)
+			return nil
+		}
+		if p.token != ast.KindEqualsGreaterThanToken {
+			p.rewind(state)
+			return nil
+		}
+		p.nextToken()
+		capture := ""
+		if p.token == ast.KindBarToken {
+			p.nextToken()
+			if !tokenIsIdentifierOrKeyword(p.token) {
+				p.rewind(state)
+				return nil
+			}
+			capture = p.parseIdentifierName().Text()
+			if p.token != ast.KindBarToken {
+				p.rewind(state)
+				return nil
+			}
+			p.nextToken()
+		}
+		body := p.parseAssignmentExpressionOrHigher()
+		arm.body = p.zigLowerSwitchArm(body, subject, capture, arm.tag, subjectIsTypeInfo, pos)
+		arms = append(arms, arm)
+		p.parseOptional(ast.KindCommaToken)
+	}
+	if p.token != ast.KindCloseBraceToken {
+		p.rewind(state)
+		return nil
+	}
+	p.nextToken()
+
+	var result *ast.Node
+	for i := len(arms) - 1; i >= 0; i-- {
+		arm := arms[i]
+		if result == nil || arm.isElse {
+			result = arm.body
+			continue
+		}
+		cond := p.zigSwitchCondition(subject, arm.tag, subjectIsTypeInfo, pos)
+		result = p.finishNode(p.factory.NewConditionalExpression(cond, nil, arm.body, nil, result), pos)
+	}
+	if result == nil {
+		p.rewind(state)
+		return nil
+	}
+	return p.finishNodeWithEnd(result, pos, p.nodePos())
 }
 
 // zigTryParseGenericValueExpression is the strict-parser-based value parse.

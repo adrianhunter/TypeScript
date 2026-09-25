@@ -65,6 +65,13 @@ func (p *Parser) parseZigBuiltinExpression() *ast.Expression {
 		return p.finishNodeWithEnd(p.factory.NewNumericLiteral("0", ast.TokenFlagsNone), pos, p.nodePos())
 	case "typeName":
 		return p.finishNodeWithEnd(p.factory.NewStringLiteral("", ast.TokenFlagsNone), pos, p.nodePos())
+	case "typeInfo":
+		// Lower to the global `typeInfo` from `builtin.ts`, which models `std.builtin.Type`.
+		if len(args) == 1 {
+			callee := p.newIdentifierAt("typeInfo", core.NewTextRange(pos, pos+len("@typeInfo")))
+			argList := p.newNodeList(core.NewTextRange(pos, p.nodePos()), args)
+			return p.finishNode(p.factory.NewCallExpression(callee, nil, nil, argList, ast.NodeFlagsNone), pos)
+		}
 	}
 	// `@import` and every other builtin (in value position) have no direct equivalent. A
 	// `globalThis` access is a valid expression of type `any` and never leaves an unresolved name.

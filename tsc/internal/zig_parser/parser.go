@@ -123,8 +123,9 @@ type Parser struct {
 	// front-end and whether they are types/namespaces or values. This lets `const X = A.B` be
 	// lowered as a namespace alias only when `A` is actually a type/namespace; otherwise it is a
 	// value field access.
-	zigTypeNames  map[string]bool
-	zigValueNames map[string]bool
+	zigTypeNames     map[string]bool
+	zigValueNames    map[string]bool
+	zigTypeInfoNames map[string]bool
 
 	// zigContextualType holds the declared type of a variable declaration while its initializer is
 	// parsed, so Zig's `.{ ... }` literals can be coerced to that type.
