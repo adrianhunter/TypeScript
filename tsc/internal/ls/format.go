@@ -69,6 +69,21 @@ func (l *LanguageService) ProvideFormatDocument(
 	}
 	_, file := l.getProgramAndFile(documentURI)
 	formatOpts := lsutil.FromLSFormatOptions(l.FormatOptions(), options)
+	// Zig has its own indentation-only formatter; the TypeScript AST formatter would rewrite Zig
+	// token spacing incorrectly.
+	if file != nil && tspath.FileExtensionIs(file.FileName(), tspath.ExtensionZig) {
+		text := file.Text()
+		formatted := zigFormatText(text, formatOpts.TabSize, formatOpts.ConvertTabsToSpaces.IsTrue())
+		if formatted == text {
+			return lsproto.TextEditsOrNull{}, nil
+		}
+		lspRange, fidelity := l.converters.ToLSPRange(file, core.NewTextRange(0, len(text)))
+		if !fidelity.IsExact() {
+			return lsproto.TextEditsOrNull{}, nil
+		}
+		edits := []*lsproto.TextEdit{{NewText: formatted, Range: lspRange}}
+		return lsproto.TextEditsOrNull{TextEdits: &edits}, nil
+	}
 	var edits []*lsproto.TextEdit
 	if file.ContentMapper() == "" {
 		edits = l.toLSProtoTextEdits(file, l.getFormattingEditsForDocument(ctx, l.formattingFile(file), formatOpts))
