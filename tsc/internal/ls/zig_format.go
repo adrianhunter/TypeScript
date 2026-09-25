@@ -16,6 +16,8 @@ func zigFormatText(text string, tabSize int, insertSpaces bool) string {
 	}
 	lines := strings.Split(text, "\n")
 	depth := 0
+	// Depths at which a `const`/`var` declaration started and is still awaiting its `;`.
+	pending := map[int]bool{}
 	var b strings.Builder
 	b.Grow(len(text) + 16)
 	for i, line := range lines {
@@ -33,14 +35,60 @@ func zigFormatText(text string, tabSize int, insertSpaces bool) string {
 		if lineDepth < 0 {
 			lineDepth = 0
 		}
+
+		newDepth := depth + zigBraceDelta(content)
+
+		// A `const`/`var` declaration must end with `;` (unlike `fn` bodies and `comptime` blocks,
+		// which are terminated by `}`); track where each one starts so a missing `;` can be added.
+		if keyword := zigDeclarationKeyword(content); keyword == "const" || keyword == "var" {
+			pending[depth] = true
+		}
+
 		b.WriteString(strings.Repeat(unit, lineDepth))
 		b.WriteString(content)
-		depth += zigBraceDelta(content)
+
+		if closed := pendingAtOrBelow(pending, newDepth); closed >= 0 {
+			last := content[len(content)-1]
+			open := last == '{' || last == '(' || last == '['
+			if !open && last != ';' && last != ',' && last != '=' {
+				b.WriteByte(';')
+			}
+			if !open && last != '=' {
+				delete(pending, closed)
+			}
+		}
+
+		depth = newDepth
 		if depth < 0 {
 			depth = 0
 		}
 	}
 	return b.String()
+}
+
+// pendingAtOrBelow returns the shallowest depth in `pending` that is at or above `depth` (i.e. whose
+// declaration has just closed), or -1 when none closed.
+func pendingAtOrBelow(pending map[int]bool, depth int) int {
+	closed := -1
+	for p := range pending {
+		if depth <= p && (closed == -1 || p < closed) {
+			closed = p
+		}
+	}
+	return closed
+}
+
+// zigDeclarationKeyword returns the declaration keyword of a line, skipping leading modifiers
+// (`pub`, `export`, `extern`, `inline`). Returns "" when the line is not a declaration.
+func zigDeclarationKeyword(content string) string {
+	for _, field := range strings.Fields(content) {
+		switch field {
+		case "pub", "export", "extern", "inline":
+			continue
+		}
+		return field
+	}
+	return ""
 }
 
 // zigBraceDelta returns the net `{`/`}` count of a line, ignoring line comments and string literals.
