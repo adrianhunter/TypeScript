@@ -306,6 +306,10 @@ func (p *Parser) desugarZigStructs(statements []*ast.Node) []*ast.Node {
 			changed = true
 			continue
 		}
+		if p.zigHoistAliasBinding(stmt) {
+			changed = true
+			continue
+		}
 		if expanded, ok := p.expandZigStruct(stmt, factories, consumed); ok {
 			out = append(out, expanded...)
 			changed = true
@@ -517,6 +521,46 @@ func (p *Parser) zigSubstituteFactoryTypeNode(node *ast.Node, paramTypes map[str
 	return node
 }
 
+// zigQualifyNestedType rewrites bare references to a container's nested type declarations so the
+// container's type alias can name them (`Type.Struct`). Without this the nested type is not in scope
+// at module level and the reference resolves to `any`.
+func (p *Parser) zigQualifyNestedType(node *ast.Node, container *ast.Node, nested map[string]bool) *ast.Node {
+	if node == nil {
+		return nil
+	}
+	switch node.Kind {
+	case ast.KindTypeReference:
+		reference := node.AsTypeReferenceNode()
+		if reference.TypeName != nil && reference.TypeName.Kind == ast.KindIdentifier && nested[reference.TypeName.Text()] {
+			name := reference.TypeName
+			qualified := p.finishNodeWithEnd(p.factory.NewQualifiedName(
+				p.newIdentifierLike(container), name,
+			), name.Pos(), name.End())
+			qualified.Parent = node
+			name.Parent = qualified
+			reference.TypeName = qualified
+		}
+		return node
+	case ast.KindArrayType:
+		array := node.AsArrayTypeNode()
+		array.ElementType = p.zigQualifyNestedType(array.ElementType, container, nested)
+		return node
+	case ast.KindUnionType:
+		union := node.AsUnionTypeNode()
+		if union.Types != nil {
+			for i, member := range union.Types.Nodes {
+				union.Types.Nodes[i] = p.zigQualifyNestedType(member, container, nested)
+			}
+		}
+		return node
+	case ast.KindParenthesizedType:
+		paren := node.AsParenthesizedTypeNode()
+		paren.Type = p.zigQualifyNestedType(paren.Type, container, nested)
+		return node
+	}
+	return node
+}
+
 // zigContainerDeclarations lowers a container body to a `type X = { ... }` alias plus a TC39 module
 // declaration (`module X { ... }`). Fields and `self` methods describe the instance type; the
 // remaining declarations (functions, nested containers, imports) live in the module, which is what
@@ -537,6 +581,27 @@ func (p *Parser) zigContainerDeclarations(nameNode *ast.Node, body *ast.Node, ex
 		if member.Kind == ast.KindFunctionDeclaration {
 			if sig, ok := p.zigMethodSignature(member); ok {
 				typeMembers = append(typeMembers, sig)
+			}
+		}
+	}
+
+	// Nested type declarations live in the container's namespace, so the instance type must name
+	// them qualified (`Type.Struct`); the bare name is not in scope at module level.
+	nested := map[string]bool{}
+	for _, member := range moduleMembers {
+		if member.Kind == ast.KindTypeAliasDeclaration {
+			if n := member.Name(); n != nil && n.Kind == ast.KindIdentifier {
+				nested[n.Text()] = true
+			}
+		}
+	}
+	if len(nested) > 0 {
+		for _, member := range typeMembers {
+			if member.Kind != ast.KindPropertySignature {
+				continue
+			}
+			if ps := member.AsPropertySignatureDeclaration(); ps != nil && ps.Type != nil {
+				ps.Type = p.zigQualifyNestedType(ps.Type, nameNode, nested)
 			}
 		}
 	}

@@ -137,17 +137,25 @@ func (l *LanguageService) addNodeOutliningSpans(ctx context.Context, sourceFile 
 		lastImport := current - 1
 		if lastImport != firstImport {
 			foldingRangeKind := lsproto.FoldingRangeKindImports
-			imports := createFoldingRangeFromBounds(
-				ctx,
-				astnav.GetStartOfNode(astnav.FindChildOfKind(statements.Nodes[firstImport],
-					ast.KindImportKeyword, sourceFile), sourceFile, false /*includeJSDoc*/),
-				statements.Nodes[lastImport].End(),
-				foldingRangeKind,
-				sourceFile,
-				l,
-			)
-			if imports != nil {
-				foldingRange = append(foldingRange, imports)
+			first := statements.Nodes[firstImport]
+			start := first.Pos()
+			// A synthesized import (lowered from `@import`) can have no `import` keyword and no
+			// source position; skip folding it rather than dereferencing nil/negative nodes.
+			if start >= 0 {
+				if keyword := astnav.FindChildOfKind(first, ast.KindImportKeyword, sourceFile); keyword != nil {
+					start = astnav.GetStartOfNode(keyword, sourceFile, false /*includeJSDoc*/)
+				}
+				imports := createFoldingRangeFromBounds(
+					ctx,
+					start,
+					statements.Nodes[lastImport].End(),
+					foldingRangeKind,
+					sourceFile,
+					l,
+				)
+				if imports != nil {
+					foldingRange = append(foldingRange, imports)
+				}
 			}
 		}
 	}

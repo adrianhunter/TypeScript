@@ -756,6 +756,10 @@ func FindChildOfKind(containingNode *ast.Node, kind ast.Kind, sourceFile *ast.So
 		if node == nil || node.Flags&ast.NodeFlagsReparsed != 0 {
 			return false
 		}
+		if node.Pos() < 0 {
+			// Synthesized node with no source position; scanning/resetting to it would panic.
+			return false
+		}
 		// Look for child in preceding tokens.
 		startPos := lastNodePos
 		for startPos < node.Pos() {
@@ -776,8 +780,10 @@ func FindChildOfKind(containingNode *ast.Node, kind ast.Kind, sourceFile *ast.So
 			return true
 		}
 
-		lastNodePos = node.End()
-		scan.ResetPos(lastNodePos)
+		if end := node.End(); end >= 0 {
+			lastNodePos = end
+			scan.ResetPos(end)
+		}
 		return false
 	}
 

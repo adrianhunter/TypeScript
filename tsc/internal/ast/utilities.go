@@ -1328,7 +1328,11 @@ func IsLiteralComputedPropertyDeclarationName(node *Node) bool {
 }
 
 func IsExternalModuleImportEqualsDeclaration(node *Node) bool {
-	return node.Kind == KindImportEqualsDeclaration && node.AsImportEqualsDeclaration().ModuleReference.Kind == KindExternalModuleReference
+	if node == nil || node.Kind != KindImportEqualsDeclaration {
+		return false
+	}
+	reference := node.AsImportEqualsDeclaration().ModuleReference
+	return reference != nil && reference.Kind == KindExternalModuleReference
 }
 
 func IsModuleOrEnumDeclaration(node *Node) bool {
@@ -1336,7 +1340,7 @@ func IsModuleOrEnumDeclaration(node *Node) bool {
 }
 
 func IsLiteralImportTypeNode(node *Node) bool {
-	return IsImportTypeNode(node) && IsLiteralTypeNode(node.AsImportTypeNode().Argument) && IsStringLiteral(node.AsImportTypeNode().Argument.AsLiteralTypeNode().Literal)
+	return node != nil && IsImportTypeNode(node) && IsLiteralTypeNode(node.AsImportTypeNode().Argument) && IsStringLiteral(node.AsImportTypeNode().Argument.AsLiteralTypeNode().Literal)
 }
 
 func IsJsxTagName(node *Node) bool {
@@ -2872,7 +2876,13 @@ func GetPragmaArgument(pragma *Pragma, name string) string {
 // The variable must not be exported and must not have a type annotation, even a jsdoc one.
 // The initializer must be a call to `require` with a string literal or a string literal-like argument.
 func IsVariableDeclarationInitializedToRequire(node *Node) bool {
+	if node == nil {
+		return false
+	}
 	if node.Kind == KindBindingElement {
+		if node.Parent == nil || node.Parent.Parent == nil {
+			return false
+		}
 		node = node.Parent.Parent
 	}
 	return isVariableDeclarationInitializedWithRequireHelper(node, false /*allowAccessedRequire*/)

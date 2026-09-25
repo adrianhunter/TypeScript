@@ -2682,6 +2682,10 @@ func GetECMALineOfPosition(sourceFile ast.SourceFileLike, pos int) int {
 // UTF-16 code unit offset from the start of that line for the given byte position.
 // Uses ECMAScript line separators (LF, CR, CRLF, LS, PS).
 func GetECMALineAndUTF16CharacterOfPosition(sourceFile ast.SourceFileLike, pos int) (line int, character core.UTF16Offset) {
+	if pos < 0 {
+		// Synthesized nodes can carry a `-1` location; treat them as the start of the file.
+		pos = 0
+	}
 	lineMap := GetECMALineStarts(sourceFile)
 	line = ComputeLineOfPosition(lineMap, pos)
 	character = core.UTF16Len(sourceFile.Text()[lineMap[line]:pos])

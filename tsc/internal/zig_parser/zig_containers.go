@@ -298,9 +298,9 @@ func (p *Parser) zigParseContainerBinding(pos int, exported bool) []*ast.Node {
 	}
 	if p.token == ast.KindEqualsToken {
 		p.nextToken()
-		if spec, ok := p.zigTryParseImportExpression(); ok {
+		if spec, specLoc, ok := p.zigTryParseImportExpression(); ok {
 			p.parseOptional(ast.KindSemicolonToken)
-			return p.zigHoistContainerImport(name, spec, exported, pos)
+			return p.zigHoistContainerImport(name, spec, exported, pos, specLoc)
 		}
 		if container := p.zigTryParseContainer(name, exported, pos); container != nil {
 			return container
@@ -346,7 +346,7 @@ func (p *Parser) zigParseContainerBinding(pos int, exported bool) []*ast.Node {
 // zigHoistContainerImport turns a container-level `const X = @import("spec")` into a module-scope
 // import (ES imports cannot appear in namespaces). The import stays visible inside the container, so
 // field/method types that reference `X` keep resolving.
-func (p *Parser) zigHoistContainerImport(name *ast.Node, spec string, exported bool, pos int) []*ast.Node {
-	p.zigHoistedImports = append(p.zigHoistedImports, p.zigImportDeclaration(name.Text(), spec, pos))
+func (p *Parser) zigHoistContainerImport(name *ast.Node, spec string, exported bool, pos int, specLoc core.TextRange) []*ast.Node {
+	p.zigHoistedImports = append(p.zigHoistedImports, p.zigImportDeclaration(name.Text(), spec, pos, specLoc))
 	return nil
 }

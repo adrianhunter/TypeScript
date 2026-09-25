@@ -230,6 +230,11 @@ func FormatDiagnosticWithColorAndContext(output io.Writer, diagnostic Diagnostic
 	if diagnostic.File() != nil {
 		file := diagnostic.File()
 		pos := diagnostic.Pos()
+		if pos < 0 {
+			// Synthesized nodes can carry a `-1` location; report them at the start of the file
+			// rather than panicking while formatting.
+			pos = 0
+		}
 		WriteLocation(output, file, pos, formatOpts, writeWithStyleAndReset)
 		fmt.Fprint(output, " - ")
 	}
@@ -240,7 +245,11 @@ func FormatDiagnosticWithColorAndContext(output io.Writer, diagnostic Diagnostic
 
 	if diagnostic.File() != nil && diagnostic.Code() != diagnostics.File_appears_to_be_binary.Code() {
 		fmt.Fprint(output, formatOpts.NewLine)
-		writeCodeSnippet(output, diagnostic.File(), diagnostic.Pos(), diagnostic.Len(), getCategoryFormat(diagnostic.Category()), "", formatOpts)
+		start := diagnostic.Pos()
+		if start < 0 {
+			start = 0
+		}
+		writeCodeSnippet(output, diagnostic.File(), start, diagnostic.Len(), getCategoryFormat(diagnostic.Category()), "", formatOpts)
 		fmt.Fprint(output, formatOpts.NewLine)
 	}
 

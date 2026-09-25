@@ -359,12 +359,12 @@ func (p *Parser) parseZigTopLevelBinding(pos int, exported bool) []*ast.Node {
 	var valueExpr *ast.Node
 	if p.token == ast.KindEqualsToken {
 		p.nextToken()
-		if spec, ok := p.zigTryParseImportExpression(); ok {
+		if spec, specLoc, ok := p.zigTryParseImportExpression(); ok {
 			if p.token == ast.KindSemicolonToken {
 				p.nextToken()
 			}
 			p.zigRecordTypeName(name.Text())
-			return p.zigImportBindingDeclarations(name, spec, exported, pos)
+			return p.zigImportBindingDeclarations(name, spec, exported, pos, specLoc)
 		}
 		if container := p.zigTryParseContainer(name, exported, pos); container != nil {
 			p.zigRecordTypeName(name.Text())
@@ -389,6 +389,15 @@ func (p *Parser) parseZigTopLevelBinding(pos int, exported bool) []*ast.Node {
 					p.zigTypeInfoNames = map[string]bool{}
 				}
 				p.zigTypeInfoNames[name.Text()] = true
+			}
+		}
+		// `const Alias = OtherImport` re-exports the imported module under a new name. This must be a
+		// namespace binding (not a value alias) so `Alias.Member` resolves.
+		if valueExpr != nil && valueExpr.Kind == ast.KindIdentifier {
+			if spec, ok := p.zigImportSpecs[valueExpr.Text()]; ok {
+				p.parseOptional(ast.KindSemicolonToken)
+				p.zigRecordTypeName(name.Text())
+				return p.zigImportBindingDeclarations(name, spec, exported, pos, core.NewTextRange(-1, -1))
 			}
 		}
 	} else {
@@ -445,34 +454,36 @@ func (p *Parser) parseZigTopLevelBinding(pos int, exported bool) []*ast.Node {
 
 // zigTryParseImportExpression consumes `@import("spec")` and returns the specifier. On failure the
 // parser is rewound.
-func (p *Parser) zigTryParseImportExpression() (string, bool) {
+func (p *Parser) zigTryParseImportExpression() (string, core.TextRange, bool) {
 	if p.token != ast.KindAtToken {
-		return "", false
+		return "", core.TextRange{}, false
 	}
 	state := p.mark()
 	p.nextToken()
 	if !(tokenIsIdentifierOrKeyword(p.token) && p.scanner.TokenValue() == "import") {
 		p.rewind(state)
-		return "", false
+		return "", core.TextRange{}, false
 	}
 	p.nextToken()
 	if p.token != ast.KindOpenParenToken {
 		p.rewind(state)
-		return "", false
+		return "", core.TextRange{}, false
 	}
 	p.nextToken()
 	if p.token != ast.KindStringLiteral {
 		p.rewind(state)
-		return "", false
+		return "", core.TextRange{}, false
 	}
 	spec := p.scanner.TokenValue()
+	// Keep the literal's source range so go-to-definition works on the specifier.
+	specLoc := core.NewTextRange(p.scanner.TokenStart(), p.scanner.TokenEnd())
 	p.nextToken()
 	if p.token != ast.KindCloseParenToken {
 		p.rewind(state)
-		return "", false
+		return "", core.TextRange{}, false
 	}
 	p.nextToken()
-	return spec, true
+	return spec, specLoc, true
 }
 
 // zigTryParseQualifiedAlias recognizes `const X = A.B;` and lowers it to a TypeScript namespace
@@ -522,8 +533,14 @@ func (p *Parser) zigTryParseQualifiedAlias(name *ast.Node, exported bool, pos in
 
 // zigImportBindingDeclarations turns `const X = @import("spec")` into a real module import and, when
 // the binding is exported, a matching re-export so `X` remains part of the public surface.
-func (p *Parser) zigImportBindingDeclarations(name *ast.Node, spec string, exported bool, pos int) []*ast.Node {
-	importDecl := p.zigImportDeclaration(name.Text(), spec, pos)
+func (p *Parser) zigImportBindingDeclarations(name *ast.Node, spec string, exported bool, pos int, specLoc core.TextRange) []*ast.Node {
+	if spec != "" && spec != "builtin" && spec != "root" {
+		if p.zigImportSpecs == nil {
+			p.zigImportSpecs = map[string]string{}
+		}
+		p.zigImportSpecs[name.Text()] = spec
+	}
+	importDecl := p.zigImportDeclaration(name.Text(), spec, pos, specLoc)
 	if !exported {
 		return []*ast.Node{importDecl}
 	}
@@ -681,6 +698,24 @@ func (p *Parser) zigLowerSwitchArm(body *ast.Node, subject *ast.Node, capture, t
 	return p.finishNode(p.factory.NewCallExpression(paren, nil, nil, p.newNodeList(core.NewTextRange(pos, pos), []*ast.Node{payload}), ast.NodeFlagsNone), pos)
 }
 
+// zigSwitchBodyOK reports whether a switch arm body is simple enough to lower safely. Complex Zig
+// forms (e.g. `orelse`, block expressions) are left to the caller's skip path.
+func zigSwitchBodyOK(body *ast.Node) bool {
+	if body == nil {
+		return false
+	}
+	switch body.Kind {
+	case ast.KindIdentifier, ast.KindNumericLiteral, ast.KindBigIntLiteral, ast.KindStringLiteral,
+		ast.KindTrueKeyword, ast.KindFalseKeyword, ast.KindNullKeyword, ast.KindPropertyAccessExpression,
+		ast.KindElementAccessExpression, ast.KindParenthesizedExpression:
+		return true
+	case ast.KindBinaryExpression:
+		binary := body.AsBinaryExpression()
+		return zigSwitchBodyOK(binary.Left) && zigSwitchBodyOK(binary.Right)
+	}
+	return false
+}
+
 // zigTryParseSwitchExpression parses `switch (subject) { .tag => |cap| body, ..., else => body }` and
 // lowers it to a conditional expression so a binding keeps a real inferred type instead of `unknown`.
 func (p *Parser) zigTryParseSwitchExpression() *ast.Node {
@@ -696,11 +731,13 @@ func (p *Parser) zigTryParseSwitchExpression() *ast.Node {
 	}
 	p.nextToken()
 	subject := p.parseAssignmentExpressionOrHigher()
-	if subject == nil || p.token != ast.KindCloseParenToken {
+	if subject == nil || !isSimpleZigValueExpression(subject) || p.token != ast.KindCloseParenToken {
 		p.rewind(state)
 		return nil
 	}
-	subjectIsTypeInfo := subject.Kind == ast.KindIdentifier && p.zigTypeInfoNames[subject.Text()]
+	// Zig unions (including `std.builtin.Type` as modeled by the project's std shim) lower to an
+	// object with one field per tag, so switch arms use `subject.tag` rather than a tag/data pair.
+	subjectIsTypeInfo := false
 	p.nextToken()
 	if p.token != ast.KindOpenBraceToken {
 		p.rewind(state)
@@ -754,8 +791,16 @@ func (p *Parser) zigTryParseSwitchExpression() *ast.Node {
 			p.nextToken()
 		}
 		body := p.parseAssignmentExpressionOrHigher()
+		if !zigSwitchBodyOK(body) {
+			p.rewind(state)
+			return nil
+		}
 		arm.body = p.zigLowerSwitchArm(body, subject, capture, arm.tag, subjectIsTypeInfo, pos)
 		arms = append(arms, arm)
+		if p.token != ast.KindCommaToken && p.token != ast.KindCloseBraceToken {
+			p.rewind(state)
+			return nil
+		}
 		p.parseOptional(ast.KindCommaToken)
 	}
 	if p.token != ast.KindCloseBraceToken {
@@ -763,6 +808,15 @@ func (p *Parser) zigTryParseSwitchExpression() *ast.Node {
 		return nil
 	}
 	p.nextToken()
+	// Only accept a switch that ends at a value boundary, so a misparsed arm can never leak tokens
+	// back into the surrounding (permissive) parser.
+	switch p.token {
+	case ast.KindSemicolonToken, ast.KindCommaToken, ast.KindCloseBraceToken,
+		ast.KindCloseParenToken, ast.KindCloseBracketToken, ast.KindEndOfFile:
+	default:
+		p.rewind(state)
+		return nil
+	}
 
 	var result *ast.Node
 	for i := len(arms) - 1; i >= 0; i-- {

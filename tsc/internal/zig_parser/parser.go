@@ -126,6 +126,8 @@ type Parser struct {
 	zigTypeNames     map[string]bool
 	zigValueNames    map[string]bool
 	zigTypeInfoNames map[string]bool
+	zigImportSpecs   map[string]string
+	zigImportSpecLoc map[*ast.Node]core.TextRange
 
 	// zigContextualType holds the declared type of a variable declaration while its initializer is
 	// parsed, so Zig's `.{ ... }` literals can be coerced to that type.
