@@ -59,6 +59,10 @@ func (t Token) IsMultilineString() bool {
 }
 
 // Keywords is the set of reserved Zig keywords.
+//
+// Note: `async`, `await`, `resume`, `suspend` and `nosuspend` were removed from
+// the language and are intentionally absent so they can be used as ordinary
+// identifiers (the standard library declares functions with these names).
 var Keywords = map[string]bool{
 	"addrspace":      true,
 	"align":          true,
@@ -67,8 +71,6 @@ var Keywords = map[string]bool{
 	"anyframe":       true,
 	"anytype":        true,
 	"asm":            true,
-	"async":          true,
-	"await":          true,
 	"break":          true,
 	"callconv":       true,
 	"catch":          true,
@@ -89,17 +91,14 @@ var Keywords = map[string]bool{
 	"linksection":    true,
 	"noalias":        true,
 	"noinline":       true,
-	"nosuspend":      true,
 	"null":           true,
 	"opaque":         true,
 	"or":             true,
 	"orelse":         true,
 	"packed":         true,
 	"pub":            true,
-	"resume":         true,
 	"return":         true,
 	"struct":         true,
-	"suspend":        true,
 	"switch":         true,
 	"test":           true,
 	"threadlocal":    true,

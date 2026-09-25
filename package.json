@@ -17,6 +17,7 @@
         "test:module-expressions": "node --test tests/*.test.ts",
         "test:module-declarations": "node --test tests/module-declarations.test.ts",
         "test:zig-files": "node --test tests/zig-files.test.ts",
+        "test:zig-stdlib": "node --test tests/zig-stdlib.test.ts",
         "test:wasm-files": "node --test tests/wasm-files.test.ts",
         "lint": "hereby lint",
         "format": "hereby format",

@@ -231,6 +231,76 @@ pub fn main() void {
         assert.match(js, /const point = \[1, 2\];/);
     });
 
+    it("lowers switch statements and expressions including else prongs", () => {
+        const result = compile({
+            "main.zig": `
+pub fn label(n: i32) []const u8 {
+    return switch (n) {
+        0 => "zero",
+        1, 2 => "small",
+        else => "other",
+    };
+}
+
+pub fn describe(n: i32) []const u8 {
+    switch (n) {
+        0 => {
+            return "zero";
+        },
+        else => {
+            return "other";
+        },
+    }
+}
+`,
+        });
+
+        assert.equal(diagnostics(result), "");
+        assert.equal(result.status, 0);
+
+        const js = result.read("main.js");
+        assert.match(js, /default:/);
+        assert.match(js, /return "other";/);
+        assert.ok(js.includes('"small"'), js);
+        assert.match(js, /switch \(/);
+
+        const dts = result.read("main.d.zig.ts");
+        assert.match(dts, /export declare function label\(n: number\): string;/);
+        assert.match(dts, /export declare function describe\(n: number\): string;/);
+    });
+
+    it("handles @hasDecl, inline @import, and @import with a .zig suffix", () => {
+        const result = compile({
+            "dep.zig": `
+pub const value = 42;
+`,
+            "main.zig": `
+const dep = @import("dep.zig");
+
+pub fn has(opts: anytype) bool {
+    return @hasDecl(opts, "field");
+}
+
+pub fn isDebug() bool {
+    return @import("builtin").mode == .debug;
+}
+
+pub fn get() i32 {
+    return dep.value;
+}
+`,
+        }, { allowArbitraryExtensions: true });
+
+        assert.equal(diagnostics(result), "");
+        assert.equal(result.status, 0);
+
+        const js = result.read("main.js");
+        assert.match(js, /import \* as dep from "\.\/dep\.zig";/);
+        assert.match(js, /"field" in opts/);
+        assert.match(js, /globalThis\.mode === "debug"/);
+        assert.match(js, /dep\.value/);
+    });
+
     it("supports function types, optional captures, and sentinel slices", () => {
         const result = compile({
             "main.zig": `

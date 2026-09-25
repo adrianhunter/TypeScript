@@ -312,14 +312,28 @@ func (t *translator) emitVariable(exported, isConst, moduleContext bool) {
 		return
 	}
 	if t.isPunct("=") && t.peek(1).Kind == zig_scanner.Builtin && t.peek(1).Value == "import" {
+		saved := t.i
 		t.next() // '='
-		spec := t.parseImportSpecifier()
-		t.write("import * as " + name + " from " + quoteJS(spec) + ";\n")
-		if exported {
-			t.write("export { " + name + " };\n")
+		spec, external := normalizeImportSpecifier(t.parseImportSpecifier())
+		if t.isPunct(";") || t.isPunct("}") || t.atEnd() {
+			if external {
+				t.write("import * as " + name + " from " + quoteJS(spec) + ";\n")
+				if exported {
+					t.write("export { " + name + " };\n")
+				}
+			} else {
+				// `@import("builtin")` / `@import("root")` do not map to real modules.
+				if exported {
+					t.write("export ")
+				}
+				t.write("const " + name + ": any = (globalThis as any);\n")
+			}
+			t.eatPunct(";")
+			return
 		}
-		t.eatPunct(";")
-		return
+		// `@import(...)` is only an import declaration when it is the whole
+		// initializer (e.g. `@import("foo").Bar` is an expression).
+		t.i = saved
 	}
 
 	// `const Name = fn(...) T;` and similar declare a type alias in Zig.
@@ -358,6 +372,20 @@ func (t *translator) emitVariable(exported, isConst, moduleContext bool) {
 	}
 	t.write(";\n")
 	t.eatPunct(";")
+}
+
+// normalizeImportSpecifier converts a Zig `@import` specifier into a TypeScript
+// module specifier. `@import("builtin")` and `@import("root")` have no module
+// to resolve to and are reported as non-external. Zig resolves `@import("x.zig")`
+// relative to the current file, so a leading `./` is added for such paths.
+func normalizeImportSpecifier(spec string) (string, bool) {
+	if spec == "builtin" || spec == "root" {
+		return "", false
+	}
+	if strings.HasSuffix(spec, ".zig") && !strings.HasPrefix(spec, ".") && !strings.HasPrefix(spec, "/") {
+		return "./" + spec, true
+	}
+	return spec, true
 }
 
 func isContainerStartToken(tok zig_scanner.Token) bool {
@@ -902,6 +930,7 @@ func (t *translator) emitSwitch(asExpression bool) {
 // `else`/default prong.
 func (t *translator) emitSwitchProng(subject string, asExpression bool) bool {
 	if t.eatKeyword("else") {
+		t.expectPunct("=>")
 		t.write(" default:")
 		t.emitSwitchProngBody(asExpression, subject, "", "")
 		return true
@@ -984,6 +1013,18 @@ func (t *translator) emitSwitchProngBody(asExpression bool, subject, firstValue,
 // --- Types ---
 
 func (t *translator) emitType() {
+	base := t.capture(func() { t.emitTypeBase() })
+	if t.isPunct("!") {
+		// Error union type `E!T`: the error set has no TypeScript equivalent, so
+		// only the payload type is kept.
+		t.next()
+		t.emitType()
+		return
+	}
+	t.write(base)
+}
+
+func (t *translator) emitTypeBase() {
 	switch {
 	case t.isPunct("?"):
 		t.next()
@@ -1057,7 +1098,11 @@ func (t *translator) emitType() {
 		if t.eatPunct("(") {
 			expr := t.capture(func() { t.emitExpr(0) })
 			t.expectPunct(")")
-			t.write("typeof " + expr)
+			if isSimpleTypeName(expr) {
+				t.write("typeof " + expr)
+			} else {
+				t.write("unknown")
+			}
 		} else {
 			t.write("unknown")
 		}
@@ -1107,6 +1152,14 @@ func (t *translator) emitArrayOrSliceType() {
 		}
 	} else if !isSlice && !t.isPunct("]") {
 		t.capture(func() { t.emitExpr(0) })
+		// `[N:sentinel]T` carries a sentinel value after the length.
+		if t.isPunct(":") {
+			sentinel = true
+			t.next()
+			if !t.isPunct("]") {
+				t.capture(func() { t.emitExpr(0) })
+			}
+		}
 	}
 	t.expectPunct("]")
 	for t.isKeyword("const") {
@@ -1177,7 +1230,11 @@ func (t *translator) emitObjectTypeLiteral() {
 			}
 			continue
 		}
+		before := t.i
 		t.skipEntry()
+		if t.i == before {
+			t.next()
+		}
 	}
 	t.expectPunct("}")
 	t.write("}")
@@ -1209,8 +1266,13 @@ func (t *translator) emitQualifiedName() {
 			return
 		}
 		if !t.eatPunct(".") {
-			return
+			break
 		}
+	}
+	// A generic instantiation in type position, e.g. `AutoHashMap(K, V)`, has no
+	// TypeScript equivalent; drop the type arguments.
+	if t.isPunct("(") {
+		t.skipBalanced()
 	}
 }
 
@@ -1387,7 +1449,7 @@ loop:
 			t.expectPunct("]")
 			if hasRange {
 				expr = expr + ".slice(" + strings.Join(parts, ", ") + ")"
-			} else {
+			} else if len(parts) > 0 {
 				expr = expr + "[" + strings.Join(parts, ", ") + "]"
 			}
 		case t.isPunct("."):
@@ -1414,9 +1476,16 @@ loop:
 			}
 			break loop
 		case t.isPunct("{"):
-			// Struct initializer: `Type{ .field = value }`.
+			// Struct initializer: `Type{ .field = value }`. Only cast when the
+			// callee is a plain type name; generic instantiations and builtins
+			// (e.g. `@Vector(3, T){ ... }`) lower to expressions that are not
+			// valid TypeScript types.
 			obj := t.capture(func() { t.emitObjectLiteral() })
-			expr = "(" + obj + " as " + expr + ")"
+			if isSimpleTypeName(expr) {
+				expr = "(" + obj + " as " + expr + ")"
+			} else {
+				expr = obj
+			}
 		default:
 			break loop
 		}
@@ -1429,20 +1498,24 @@ func (t *translator) emitPrimary() {
 	switch tok.Kind {
 	case zig_scanner.Number:
 		t.next()
-		t.write(tok.Value)
+		t.write(normalizeNumber(tok.Value))
 	case zig_scanner.String:
 		t.emitString()
 	case zig_scanner.Char:
 		t.next()
-		t.write(quoteJS(tok.Value))
+		t.write(quoteChar(tok.Value))
 	case zig_scanner.Identifier:
 		t.next()
 		switch tok.Value {
 		case "true", "false", "null", "undefined":
 			t.write(tok.Value)
 		default:
-			if builtin, ok := builtinTypeName(tok.Value); ok {
-				t.write(builtin)
+			if _, ok := builtinTypeName(tok.Value); ok {
+				// Builtin type names (`u8`, `bool`, `void`, ...) have no value
+				// representation; when they appear in expression position (for
+				// example as a call argument like `HashMap(void)`) lower them to
+				// a placeholder so the generated TypeScript parses.
+				t.write("undefined")
 			} else {
 				t.write(tsSafeIdent(tok.Value))
 			}
@@ -1476,6 +1549,8 @@ func (t *translator) emitPrimary() {
 		case "type":
 			t.next()
 			t.write("unknown")
+		case "struct", "union", "opaque", "enum", "packed":
+			t.emitAnonymousContainer()
 		default:
 			t.next()
 			t.write("undefined")
@@ -1500,6 +1575,23 @@ func (t *translator) emitPrimary() {
 			t.write("undefined")
 		}
 	}
+}
+
+// normalizeNumber rewrites Zig numeric literals that TypeScript cannot parse.
+// In particular Zig hexadecimal floating point literals (`0x1.8p3`) are not
+// valid JavaScript and are converted to their decimal representation.
+func normalizeNumber(value string) string {
+	if len(value) >= 2 && value[0] == '0' && (value[1] == 'x' || value[1] == 'X') && strings.ContainsAny(value, ".pP") {
+		hex := value
+		if !strings.ContainsAny(hex, "pP") {
+			// Go's hexadecimal float parser requires a binary exponent.
+			hex += "p0"
+		}
+		if f, err := strconv.ParseFloat(hex, 64); err == nil {
+			return strconv.FormatFloat(f, 'g', -1, 64)
+		}
+	}
+	return value
 }
 
 func (t *translator) emitString() {
@@ -1551,6 +1643,59 @@ func (t *translator) emitIfExpression() {
 		condExpr = cond + " != null"
 	}
 	t.write("(" + condExpr + " ? " + then + " : " + elseExpr + ")")
+}
+
+// isSimpleTypeName reports whether name is a plain (possibly qualified)
+// TypeScript type reference, i.e. an identifier made up of identifier
+// characters and dots.
+func isSimpleTypeName(name string) bool {
+	if name == "" {
+		return false
+	}
+	for i, r := range name {
+		valid := r == '_' || r == '$' || r == '.' ||
+			r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9'
+		if !valid || i == 0 && (r == '.' || r >= '0' && r <= '9') {
+			return false
+		}
+	}
+	return true
+}
+
+// emitAnonymousContainer lowers an anonymous `struct`/`union`/`enum`/`opaque`
+// literal used in expression position (commonly `return struct { ... };`) to a
+// module expression.
+func (t *translator) emitAnonymousContainer() {
+	if t.isKeyword("packed") {
+		t.next()
+	}
+	kind := t.tok().Value
+	t.next() // struct / union / opaque / enum
+
+	if kind == "enum" {
+		t.skipContainerTag()
+		members := t.parseEnumMembers()
+		t.write("(module {")
+		for i, member := range members {
+			if i > 0 {
+				t.write(" ")
+			}
+			t.write("export const " + tsSafeMember(member) + " = " + quoteJS(member) + ";")
+		}
+		t.write("})")
+		return
+	}
+	if kind == "opaque" {
+		if t.isPunct("{") {
+			t.skipBalanced()
+		}
+		t.write("(module {})")
+		return
+	}
+	t.skipContainerTag()
+	t.write("(module ")
+	t.emitModuleBody()
+	t.write(")")
 }
 
 // emitObjectLiteral lowers `.{ .a = 1 }` / `Type{ .a = 1 }` struct literals to
@@ -1631,10 +1776,22 @@ func (t *translator) parseBuiltin() {
 
 	switch name {
 	case "import":
-		t.write("__zigImport__(" + strings.Join(args, ", ") + ")")
+		// Inline `@import(...)` usage. Real module imports are emitted as import
+		// declarations by emitVariable; anything left here (e.g. `builtin`,
+		// `root`, or an inline use) has no module to resolve to.
+		t.write("(globalThis as any)")
+	case "hasDecl":
+		if len(args) == 2 {
+			t.write("(" + args[1] + " in (" + args[0] + " as any))")
+			return
+		}
+		t.write("false")
 	case "as":
 		if len(args) == 2 {
-			t.write("(" + args[1] + " as " + args[0] + ")")
+			// A Zig `@as(T, v)` is a typed value. The first argument is a type
+			// that may not have a valid TypeScript type expression equivalent
+			// (e.g. `@Vector(3, T)`), so only the value is preserved.
+			t.write("(" + args[1] + ")")
 			return
 		}
 		t.write("undefined")
@@ -1650,7 +1807,9 @@ func (t *translator) parseBuiltin() {
 	case "typeName":
 		t.write(`""`)
 	case "This":
-		t.write("this")
+		// `@This()` is the enclosing type; there is no direct TypeScript
+		// equivalent, so it degrades to an untyped value.
+		t.write("({} as any)")
 	case "field":
 		if len(args) == 2 {
 			t.write(args[0] + "[" + args[1] + "]")
@@ -1664,15 +1823,18 @@ func (t *translator) parseBuiltin() {
 		}
 		t.write("undefined")
 	case "TypeOf":
-		if len(args) == 1 {
+		if len(args) == 1 && isSimpleTypeName(args[0]) {
 			t.write("typeof " + args[0])
 			return
 		}
-		t.write("unknown")
+		t.write("(globalThis as any)")
 	case "compileError":
 		t.write(`(() => { throw new Error("compile error"); })()`)
 	default:
-		t.write("__zig" + name + "__(" + strings.Join(args, ", ") + ")")
+		// Unknown builtins (e.g. `@typeInfo`, `@tagName`) have no TypeScript
+		// equivalent; call through a global so no unresolved helper name is
+		// emitted.
+		t.write("(globalThis as any).__zig" + name + "__(" + strings.Join(args, ", ") + ")")
 	}
 }
 
@@ -1871,14 +2033,43 @@ func tsSafeIdent(name string) string {
 	if reservedWords[name] {
 		return name + "_"
 	}
-	return name
+	return sanitizeIdentifier(name)
 }
 
 func tsSafeMember(name string) string {
 	if name == "" {
 		return "_"
 	}
-	return name
+	if reservedWords[name] {
+		return name + "_"
+	}
+	return sanitizeIdentifier(name)
+}
+
+// sanitizeIdentifier turns an arbitrary Zig identifier (including quoted
+// identifiers such as `@"PE32+"`) into a valid TypeScript identifier by
+// replacing unsupported characters with `_` and prefixing leading digits.
+func sanitizeIdentifier(name string) string {
+	if name == "" {
+		return "_"
+	}
+	var sb strings.Builder
+	for _, r := range name {
+		if r == '_' || r == '$' ||
+			r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' {
+			sb.WriteRune(r)
+		} else {
+			sb.WriteByte('_')
+		}
+	}
+	result := sb.String()
+	if result == "" {
+		return "_"
+	}
+	if result[0] >= '0' && result[0] <= '9' {
+		return "_" + result
+	}
+	return result
 }
 
 func sanitizeName(name string) string {
@@ -1899,6 +2090,37 @@ func sanitizeName(name string) string {
 // quoteJS wraps raw Zig string contents in a JavaScript double quoted string.
 func quoteJS(value string) string {
 	return `"` + escapeJSContent(value) + `"`
+}
+
+// quoteChar wraps the contents of a Zig character literal in a JavaScript
+// double quoted string. Escape sequences already present in the literal are
+// preserved, while unescaped quotes and control characters are escaped.
+func quoteChar(value string) string {
+	var sb strings.Builder
+	sb.WriteByte('"')
+	for i := 0; i < len(value); i++ {
+		c := value[i]
+		if c == '\\' && i+1 < len(value) {
+			sb.WriteByte(c)
+			i++
+			sb.WriteByte(value[i])
+			continue
+		}
+		switch c {
+		case '"':
+			sb.WriteString(`\"`)
+		case '\n':
+			sb.WriteString(`\n`)
+		case '\r':
+			sb.WriteString(`\r`)
+		case '\t':
+			sb.WriteString(`\t`)
+		default:
+			sb.WriteByte(c)
+		}
+	}
+	sb.WriteByte('"')
+	return sb.String()
 }
 
 // quoteMultilineJS joins Zig multiline string lines into a single escaped
