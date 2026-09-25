@@ -11,7 +11,8 @@ import (
 	"github.com/microsoft/TypeScript/tsc/internal/core"
 	"github.com/microsoft/TypeScript/tsc/internal/debug"
 	"github.com/microsoft/TypeScript/tsc/internal/diagnostics"
-	"github.com/microsoft/TypeScript/tsc/internal/scanner"
+	scanner "github.com/microsoft/TypeScript/tsc/internal/zig_scanner"
+
 	"github.com/microsoft/TypeScript/tsc/internal/stringutil"
 	"github.com/microsoft/TypeScript/tsc/internal/tspath"
 )
@@ -133,10 +134,8 @@ func putParser(p *Parser) {
 	parserPool.Put(p)
 }
 
-// parseTypeScriptSourceFile parses generated or hand written TypeScript. It is
-// the backend used by ParseSourceFile after a Zig source file has been lowered
-// to TypeScript, but is also usable directly.
-func parseTypeScriptSourceFile(opts ast.SourceFileParseOptions, sourceText string, scriptKind core.ScriptKind) *ast.SourceFile {
+func ParseSourceFile(opts ast.SourceFileParseOptions, sourceText string, scriptKind core.ScriptKind) *ast.SourceFile {
+
 	p := getParser()
 	defer putParser(p)
 	p.initializeState(opts, sourceText, scriptKind)
@@ -3473,19 +3472,23 @@ func (p *Parser) parseReturnType(returnToken ast.Kind, isType bool) *ast.TypeNod
 	return nil
 }
 
+//	func (p *Parser) shouldParseReturnType(returnToken ast.Kind, isType bool) bool {
+//		if returnToken == ast.KindEqualsGreaterThanToken {
+//			p.parseExpected(returnToken)
+//			return true
+//		}
+//		return true
+//	}
 func (p *Parser) shouldParseReturnType(returnToken ast.Kind, isType bool) bool {
+	if p.token == ast.KindTypeKeyword || (p.token == ast.KindIdentifier && p.scanner.TokenValue() == "type") {
+		p.nextToken()
+		return false
+	}
 	if returnToken == ast.KindEqualsGreaterThanToken {
 		p.parseExpected(returnToken)
 		return true
-	} else if p.parseOptional(ast.KindColonToken) {
-		return true
-	} else if isType && p.token == ast.KindEqualsGreaterThanToken {
-		// This is easy to get backward, especially in type contexts, so parse the type anyway
-		p.parseErrorAtCurrentToken(diagnostics.X_0_expected, scanner.TokenToString(ast.KindColonToken))
-		p.nextToken()
-		return true
 	}
-	return false
+	return true
 }
 
 func (p *Parser) parseTypeOrTypePredicate() *ast.TypeNode {
