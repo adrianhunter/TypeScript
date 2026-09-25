@@ -155,8 +155,7 @@ func (p *Parser) parseZigTopLevel() []*ast.Node {
 		return nil
 	}
 	if p.zigIsIdent("test") {
-		p.parseZigTest()
-		return nil
+		return p.parseZigTest()
 	}
 	p.zigSkipToSemicolonOrBlock()
 	return nil
@@ -277,7 +276,11 @@ func (p *Parser) zigSynthesizeFunctionBody(returnType *ast.Node, bodyStart int) 
 // (`new`, `interface`, ...) are prefixed, and duplicate names (`_`, `_`) are disambiguated.
 func (p *Parser) parseZigParameter(used map[string]bool) *ast.Node {
 	pos := p.nodePos()
+	sawComptime := false
 	for p.zigIsIdent("comptime") || p.zigIsIdent("noalias") {
+		if p.zigIsIdent("comptime") {
+			sawComptime = true
+		}
 		p.nextToken()
 	}
 	if p.token == ast.KindDotDotDotToken {
@@ -302,6 +305,12 @@ func (p *Parser) parseZigParameter(used map[string]bool) *ast.Node {
 	paramType := p.zigUnknownTypeAt(pos)
 	if p.token == ast.KindColonToken {
 		p.nextToken()
+		if sawComptime && name != nil && p.token == ast.KindTypeKeyword {
+			if p.zigGenericTypeParams == nil {
+				p.zigGenericTypeParams = map[string]bool{}
+			}
+			p.zigGenericTypeParams[name.Text()] = true
+		}
 		paramType = p.zigParseParameterType(pos)
 	}
 
@@ -348,8 +357,11 @@ func (p *Parser) parseZigTopLevelBinding(pos int, exported bool) []*ast.Node {
 	if p.token == ast.KindColonToken {
 		p.nextToken()
 		declaredType = p.zigTryParseType(pos, func() bool {
-			return p.token == ast.KindEqualsToken || p.token == ast.KindSemicolonToken
+			return p.token == ast.KindEqualsToken || p.token == ast.KindSemicolonToken ||
+				p.zigIsIdent("align") || p.zigIsIdent("addrspace") || p.zigIsIdent("linksection")
 		})
+		// `var x: T align(16) = ...`: consume type suffixes so the initializer is still parsed.
+		p.zigSkipPostParamModifiers()
 	}
 	var valueExpr *ast.Node
 	if p.token == ast.KindEqualsToken {
@@ -371,10 +383,28 @@ func (p *Parser) parseZigTopLevelBinding(pos int, exported bool) []*ast.Node {
 		}
 		// Preserve simple initializers (identifiers, property accesses, calls, literals) so the
 		// language service can offer member completions and hovers inside them. Complex or
-		// unsupported values are skipped as before.
+		// unsupported values are skipped as before. Use the declared type as the contextual type so
+		// `const x: Foo = .{}` is coerced to `Foo` (Zig fills in field defaults) instead of being a
+		// bare `{}` assignment error.
+		savedContextualType := p.zigContextualType
+		p.zigContextualType = declaredType
 		valueExpr = p.zigTryParseValueExpression()
+		p.zigContextualType = savedContextualType
+		// A Zig type used as a value (e.g. `error{OutOfMemory}` reaching the literal path as
+		// `[OutOfMemory] as error`) asserts to a type with no TypeScript equivalent. Drop it so the
+		// binding lowers to `unknown` instead of leaking the unresolved type name.
+		if valueExpr != nil && valueExpr.Kind == ast.KindAsExpression {
+			if ae := valueExpr.AsAsExpression(); ae.Type != nil && ae.Type.Kind == ast.KindTypeReference {
+				if n := ae.Type.AsTypeReferenceNode().TypeName; n != nil && n.Kind == ast.KindIdentifier && !p.zigTypeNames[n.Text()] {
+					valueExpr = nil
+				}
+			}
+		}
 		if valueExpr == nil {
 			p.zigSkipValue()
+		}
+		if p.zigTestBodyDepth > 0 {
+			valueExpr = p.zigSanitizeTestValue(name.Text(), declaredType, valueExpr, pos)
 		}
 		// Remember bindings backed by `@typeInfo`, which are modeled as the tagged `Type` union
 		// (`{ tag; data }`) so a `switch` over them can be lowered with tag/data narrowing.
@@ -548,17 +578,52 @@ func (p *Parser) zigImportBindingDeclarations(name *ast.Node, spec string, expor
 	return []*ast.Node{importDecl, exportDecl}
 }
 
-// parseZigTest skips a `test "name" { ... }` declaration.
-func (p *Parser) parseZigTest() {
+// parseZigTest lowers a `test "name" { ... }` declaration into a namespace whose members are the
+// declarations inside the block. Zig test bodies mix declarations with statements the TypeScript
+// grammar cannot model (`try`, `defer`, `assert`); those are skipped, but the bindings are kept so
+// hover/completions resolve them instead of reporting `any`.
+func (p *Parser) parseZigTest() []*ast.Node {
+	pos := p.nodePos()
 	p.nextToken() // `test`
 	if p.token == ast.KindStringLiteral || p.token == ast.KindIdentifier {
 		p.nextToken()
 	}
-	if p.token == ast.KindOpenBraceToken {
-		p.zigSkipBalanced(ast.KindOpenBraceToken, ast.KindCloseBraceToken)
-	} else {
+	if p.token != ast.KindOpenBraceToken {
 		p.zigSkipToSemicolon()
+		return nil
 	}
+	p.nextToken() // `{`
+	savedDepth := p.zigTestBodyDepth
+	savedKnown := p.zigLocalKnownType
+	p.zigTestBodyDepth++
+	p.zigLocalKnownType = map[string]bool{}
+	var members []*ast.Node
+	for p.token != ast.KindCloseBraceToken && p.token != ast.KindEndOfFile {
+		if p.parseOptional(ast.KindSemicolonToken) || p.parseOptional(ast.KindCommaToken) {
+			continue
+		}
+		before := p.scanner.TokenFullStart()
+		members = append(members, p.parseZigTopLevel()...)
+		if p.scanner.TokenFullStart() == before {
+			p.nextToken()
+		}
+	}
+	end := p.nodePos()
+	if p.token == ast.KindCloseBraceToken {
+		p.nextToken()
+		end = p.nodePos()
+	}
+	p.zigTestBodyDepth = savedDepth
+	p.zigLocalKnownType = savedKnown
+	moduleBlock := p.finishNodeWithEnd(p.factory.NewModuleBlock(
+		p.newNodeList(core.NewTextRange(pos, end), members),
+	), pos, end)
+	name := p.newIdentifierAt("test_"+strconv.Itoa(pos), core.NewTextRange(pos, pos))
+	moduleDecl := p.finishNodeWithEnd(p.factory.NewModuleDeclaration(
+		nil, ast.KindModuleKeyword, name, nil, moduleBlock,
+	), pos, end)
+	moduleDecl.Flags |= ast.NodeFlagsModuleFragment
+	return []*ast.Node{moduleDecl}
 }
 
 // ---------------------------------------------------------------- type helpers
@@ -607,6 +672,57 @@ func (p *Parser) zigUnknownValueOfType(typ *ast.Node, pos int) *ast.Node {
 		return value
 	}
 	return p.finishNodeWithEnd(p.factory.NewAsExpression(value, typ), pos, pos)
+}
+
+// zigSanitizeTestValue approximates a test-local initializer so the permissive model never reports
+// checker errors, while keeping as much type information as possible for hover:
+//   - a declared type wins, and the initializer becomes a permissive value of that type;
+//   - a call whose callee resolves to a type/namespace (or a test-local whose type is known) keeps
+//     its result type, with arguments replaced by `never` placeholders so they are not checked;
+//   - anything else becomes `unknown`.
+func (p *Parser) zigSanitizeTestValue(name string, declaredType, valueExpr *ast.Node, pos int) *ast.Node {
+	if declaredType != nil {
+		p.zigMarkLocalKnownType(name)
+		return nil
+	}
+	if valueExpr != nil && valueExpr.Kind == ast.KindCallExpression {
+		call := valueExpr.AsCallExpression()
+		if call.Expression != nil && p.zigTestCallRootIsSafe(call.Expression) {
+			p.zigMarkLocalKnownType(name)
+			if call.Arguments != nil {
+				args := make([]*ast.Node, len(call.Arguments.Nodes))
+				for i := range args {
+					arg := p.zigNeverExpression(pos)
+					arg.Parent = valueExpr
+					args[i] = arg
+				}
+				call.Arguments = p.newNodeList(core.NewTextRange(pos, pos), args)
+			}
+			return valueExpr
+		}
+	}
+	return nil
+}
+
+// zigMarkLocalKnownType records a test-local as having a known type.
+func (p *Parser) zigMarkLocalKnownType(name string) {
+	if p.zigLocalKnownType == nil {
+		p.zigLocalKnownType = map[string]bool{}
+	}
+	p.zigLocalKnownType[name] = true
+}
+
+// zigTestCallRootIsSafe reports whether a call's callee chain roots at a type/namespace or a
+// test-local with a known type, so its result type is meaningful.
+func (p *Parser) zigTestCallRootIsSafe(expr *ast.Node) bool {
+	for expr != nil && expr.Kind == ast.KindPropertyAccessExpression {
+		expr = expr.AsPropertyAccessExpression().Expression
+	}
+	if expr == nil || expr.Kind != ast.KindIdentifier {
+		return false
+	}
+	name := expr.Text()
+	return p.zigTypeNames[name] || p.zigLocalKnownType[name]
 }
 
 // zigTryParseValueExpression speculatively parses a binding initializer with the strict expression
@@ -945,11 +1061,33 @@ func zigTypeIsKeywordNode(node *ast.Node, kind ast.Kind) bool {
 
 // zigNormalizeType maps Zig type syntax with no TypeScript equivalent onto `unknown`.
 func (p *Parser) zigNormalizeType(typ *ast.Node, pos int) *ast.Node {
+	if typ != nil && typ.Kind == ast.KindArrayType {
+		arr := typ.AsArrayTypeNode()
+		if arr != nil && arr.ElementType != nil {
+			if elem := p.zigNormalizeType(arr.ElementType, pos); elem != arr.ElementType {
+				// The array node was already finished, so attach the replacement to keep the tree's
+				// parent links intact (flow analysis walks them).
+				elem.Parent = typ
+				arr.ElementType = elem
+			}
+		}
+		return typ
+	}
 	if typ != nil && typ.Kind == ast.KindTypeReference {
 		if name := typ.AsTypeReferenceNode().TypeName; name != nil {
 			if name.Kind == ast.KindIdentifier {
 				switch name.Text() {
 				case "error", "anyerror", "anyopaque", "anyframe", "anytype", "type":
+					return p.zigUnknownTypeAt(pos)
+				}
+				if p.zigGenericTypeParams[name.Text()] {
+					return p.zigUnknownTypeAt(pos)
+				}
+				// A generic type-constructor expression such as `Tag(@TypeOf(u))` or `ArrayList(u8)`
+				// has no TypeScript equivalent: the base may name a function or a generic type, and
+				// neither can be rendered as a TypeScript type reference. Error recovery leaves the
+				// trailing call outside the reference's name, so compare the spans too.
+				if typ.AsTypeReferenceNode().TypeArguments != nil || name.End() < typ.End() {
 					return p.zigUnknownTypeAt(pos)
 				}
 			} else if name.Kind == ast.KindQualifiedName {

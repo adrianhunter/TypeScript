@@ -126,8 +126,13 @@ type Parser struct {
 	zigTypeNames     map[string]bool
 	zigValueNames    map[string]bool
 	zigTypeInfoNames map[string]bool
-	zigImportSpecs   map[string]string
-	zigImportSpecLoc map[*ast.Node]core.TextRange
+
+	// zigGenericTypeParams records `comptime T: type` parameter names that are in scope for the
+	// current function signature. A bare reference to such a name in a parameter or return type has
+	// no TypeScript equivalent, so it is lowered to `unknown`.
+	zigGenericTypeParams map[string]bool
+	zigImportSpecs       map[string]string
+	zigImportSpecLoc     map[*ast.Node]core.TextRange
 
 	// zigContainerFields records, per declared container type, the declared type of each field
 	// (`Foo -> { args -> []const []const u8 }`). It lets a field value in a container literal get the
@@ -144,6 +149,14 @@ type Parser struct {
 	// zigTernaryConsequentDepth is non-zero while parsing the true-branch of a `?:` expression,
 	// where `<identifier> :` must not be mistaken for a Zig labeled block.
 	zigTernaryConsequentDepth int
+
+	// zigTestBodyDepth is non-zero while parsing the body of a `test { ... }` block. Test-local
+	// bindings are exposed for hover/completions, but their initializers are approximated so the
+	// permissive model never reports checker errors.
+	zigTestBodyDepth int
+	// zigLocalKnownType records test-local names whose type is known (declared, or inferred from a
+	// call whose callee resolves), so a later call on them can keep its result type.
+	zigLocalKnownType map[string]bool
 }
 
 func newParser() *Parser {
