@@ -117,14 +117,48 @@ func (p *Parser) zigLiteralIsFieldAssignment() bool {
 // that stays in the container's module body.
 func (p *Parser) parseZigContainerMember() *ast.Node {
 	var member *ast.Node
-	if p.token == ast.KindIdentifier && p.lookAhead((*Parser).nextTokenIsColon) {
+	switch {
+	case p.token == ast.KindIdentifier && p.lookAhead((*Parser).nextTokenIsColon):
 		member = p.parseZigContainerField()
-	} else {
+	case p.zigContainerMemberIsConstVar():
+		member = p.parseZigContainerBinding()
+	default:
 		member = p.parseStatement()
 	}
 	// Real Zig separates container members with commas; also accept a semicolon for the dialect.
 	p.parseOptional(ast.KindCommaToken)
 	return member
+}
+
+// zigContainerMemberIsConstVar reports whether the upcoming member is a `[pub] const/var` binding.
+func (p *Parser) zigContainerMemberIsConstVar() bool {
+	return p.lookAhead(func(p *Parser) bool {
+		if p.token == ast.KindExportKeyword {
+			p.nextToken()
+		}
+		return p.token == ast.KindConstKeyword || p.token == ast.KindVarKeyword
+	})
+}
+
+// parseZigContainerBinding parses a single `[pub] const/var` container member. Unlike the generic
+// statement parser it does not consume the comma-separated declaration list, because in a Zig
+// container the comma is a member separator.
+func (p *Parser) parseZigContainerBinding() *ast.Node {
+	pos := p.nodePos()
+	jsdoc := p.jsdocScannerInfo()
+	modifiers := p.parseModifiers()
+	isConst := p.token == ast.KindConstKeyword
+	p.nextToken() // const / var
+	decl := p.parseVariableDeclaration()
+	listFlags := ast.NodeFlagsLet
+	if isConst {
+		listFlags = ast.NodeFlagsConst
+	}
+	declList := p.finishNode(p.factory.NewVariableDeclarationList(p.newNodeList(decl.Loc, []*ast.Node{decl}), listFlags), pos)
+	result := p.finishNode(p.factory.NewVariableStatement(modifiers, declList), pos)
+	p.withJSDoc(result, jsdoc)
+	p.checkJSSyntax(result)
+	return result
 }
 
 // parseZigContainerField parses a container field (`name: Type` with an optional `= default`). It

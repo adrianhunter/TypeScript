@@ -146,15 +146,35 @@ func putParser(p *Parser) {
 }
 
 func ParseSourceFile(opts ast.SourceFileParseOptions, sourceText string, scriptKind core.ScriptKind) *ast.SourceFile {
-
+	// First try the strict TypeScript-dialect parser. If the source is genuine Zig it will report
+	// syntax errors, in which case we fall back to the permissive Zig front-end.
+	if result, ok := safeParseDialect(opts, sourceText, scriptKind); ok {
+		return result
+	}
 	p := getParser()
 	defer putParser(p)
 	p.initializeState(opts, sourceText, scriptKind)
 	p.nextToken()
+	return p.parseZigSourceFile()
+}
+
+// safeParseDialect runs the strict parser and reports whether it produced a diagnostic-free tree.
+func safeParseDialect(opts ast.SourceFileParseOptions, sourceText string, scriptKind core.ScriptKind) (result *ast.SourceFile, ok bool) {
+	p := getParser()
+	defer putParser(p)
+	defer func() {
+		if recover() != nil {
+			result, ok = nil, false
+		}
+	}()
+	p.initializeState(opts, sourceText, scriptKind)
+	p.nextToken()
 	if p.scriptKind == core.ScriptKindJSON {
-		return p.parseJSONText()
+		result = p.parseJSONText()
+	} else {
+		result = p.parseSourceFileWorker()
 	}
-	return p.parseSourceFileWorker()
+	return result, len(result.Diagnostics()) == 0
 }
 func (p *Parser) initializeClosures() {
 	p.setParentFromContext = func(n *ast.Node) bool {
