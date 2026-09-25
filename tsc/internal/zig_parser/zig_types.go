@@ -30,7 +30,7 @@ func zigBuiltinTypeKind(name string) (ast.Kind, bool) {
 	case "noreturn":
 		return ast.KindNeverKeyword, true
 	case "anytype":
-		return ast.KindAnyKeyword, true
+		return ast.KindUnknownKeyword, true
 	case "anyframe", "type", "anyopaque":
 		return ast.KindUnknownKeyword, true
 	}

@@ -121,6 +121,13 @@ type Parser struct {
 	// zigContextualType holds the declared type of a variable declaration while its initializer is
 	// parsed, so Zig's `.{ ... }` literals can be coerced to that type.
 	zigContextualType *ast.Node
+
+	// zigBlockLabels is the stack of active Zig labeled-block expressions. While non-empty, a
+	// `break :label value;` is lowered to a `return value;` (the block is emitted as an IIFE).
+	zigBlockLabels []string
+	// zigTernaryConsequentDepth is non-zero while parsing the true-branch of a `?:` expression,
+	// where `<identifier> :` must not be mistaken for a Zig labeled block.
+	zigTernaryConsequentDepth int
 }
 
 func newParser() *Parser {
@@ -1388,6 +1395,20 @@ func (p *Parser) parseBreakStatement() *ast.Node {
 	pos := p.nodePos()
 	jsdoc := p.jsdocScannerInfo()
 	p.parseExpected(ast.KindBreakKeyword)
+	// Zig labeled-block break: `break :label [value];`. The enclosing labeled block is emitted as an
+	// IIFE, so the break becomes a return from that function.
+	if p.token == ast.KindColonToken && len(p.zigBlockLabels) > 0 {
+		p.nextToken() // ':'
+		p.parseIdentifier()
+		var expression *ast.Expression
+		if !p.canParseSemicolon() {
+			expression = p.parseExpressionAllowIn()
+		}
+		p.parseSemicolon()
+		result := p.finishNode(p.factory.NewReturnStatement(expression), pos)
+		p.withJSDoc(result, jsdoc)
+		return result
+	}
 	label := p.parseIdentifierUnlessAtSemicolon()
 	p.parseSemicolon()
 	result := p.finishNode(p.factory.NewBreakStatement(label), pos)
@@ -4728,7 +4749,9 @@ func (p *Parser) parseConditionalExpressionRest(leftOperand *ast.Expression, pos
 	// we do not that for the 'whenFalse' part.
 	saveContextFlags := p.contextFlags
 	p.setContextFlags(ast.NodeFlagsDisallowInContext, false)
+	p.zigTernaryConsequentDepth++
 	trueExpression := p.parseAssignmentExpressionOrHigherWorker(false /*allowReturnTypeInArrowFunction*/)
+	p.zigTernaryConsequentDepth--
 	p.contextFlags = saveContextFlags
 	colonToken := p.parseExpectedToken(ast.KindColonToken)
 	var falseExpression *ast.Expression
@@ -5738,6 +5761,10 @@ func (p *Parser) parseTemplateSpan(isTaggedTemplate bool) *ast.Node {
 }
 
 func (p *Parser) parsePrimaryExpression() *ast.Expression {
+	// Zig labeled block expression: `label: { ... break :label value; }`.
+	if p.token == ast.KindIdentifier && p.zigTernaryConsequentDepth == 0 && p.lookAhead((*Parser).nextTokenIsColonThenOpenBrace) {
+		return p.parseZigLabeledBlockExpression()
+	}
 	switch p.token {
 	case ast.KindNoSubstitutionTemplateLiteral:
 		if p.scanner.TokenFlags()&ast.TokenFlagsIsInvalid != 0 {

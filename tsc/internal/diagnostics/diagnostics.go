@@ -15,6 +15,13 @@ import (
 
 //go:generate npx hereby generate:diagnostics
 
+// Custom diagnostic codes outside the generated TypeScript message catalogue.
+const (
+	// CodeZigFileNotFullySupported is reported when a Zig file is lowered by the permissive
+	// front-end because the strict parser could not model it.
+	CodeZigFileNotFullySupported int32 = 95000
+)
+
 type Category int32
 
 const (

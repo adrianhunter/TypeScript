@@ -3,15 +3,17 @@ package zig_parser
 import (
 	"github.com/microsoft/TypeScript/tsc/internal/ast"
 	"github.com/microsoft/TypeScript/tsc/internal/core"
+	"github.com/microsoft/TypeScript/tsc/internal/diagnostics"
 )
 
 // This file implements a permissive front-end for real Zig source. It does not attempt to type
 // check Zig; instead it builds a well-formed TypeScript AST that captures the top-level shape of the
-// file (declarations and function signatures) while lowering everything it does not model to `any`.
-// The AST keeps the original source positions so hover/go-to-definition still work.
+// file (declarations and function signatures) while lowering everything it does not model to
+// `unknown`. The AST keeps the original source positions so hover/go-to-definition still work.
 //
 // The strict TypeScript dialect parser (parser.go + zig_struct.go) is tried first; this front-end is
-// only used when that parser reports syntax errors, i.e. for genuine Zig.
+// only used when that parser reports syntax errors, i.e. for genuine Zig. Falling back is reported as
+// a compiler error so unsupported constructs are never silently accepted.
 
 // parseZigSourceFile parses a real Zig source file into a permissive TypeScript AST.
 func (p *Parser) parseZigSourceFile() *ast.SourceFile {
@@ -33,6 +35,16 @@ func (p *Parser) parseZigSourceFile() *ast.SourceFile {
 	}
 	node := p.finishNode(p.factory.NewSourceFile(p.opts, p.sourceText, p.newNodeList(core.NewTextRange(pos, end), statements), eof), pos)
 	result := node.AsSourceFile()
+	// The strict parser could not model this file, so the declarations below are only an
+	// approximation. Surface an error instead of silently emitting `any`.
+	p.diagnostics = append(p.diagnostics, ast.NewDiagnosticFromText(
+		nil,
+		core.NewTextRange(pos, pos),
+		diagnostics.CodeZigFileNotFullySupported,
+		diagnostics.CategoryError,
+		"Zig file contains constructs that are not fully supported; declarations are approximated as 'unknown'.",
+		nil, nil, false, false,
+	))
 	p.finishSourceFile(result, false)
 	collectExternalModuleReferences(result)
 	return result
@@ -152,7 +164,7 @@ func (p *Parser) parseZigFunction(pos int, exported bool) *ast.Node {
 		name,
 		nil,
 		p.newNodeList(core.NewTextRange(pos, p.nodePos()), params),
-		p.zigAnyTypeAt(p.nodePos()),
+		p.zigUnknownTypeAt(p.nodePos()),
 		nil,
 		body,
 	), pos)
@@ -169,7 +181,7 @@ func (p *Parser) parseZigParameter() *ast.Node {
 	if p.token == ast.KindDotDotDotToken {
 		p.nextToken()
 		return p.finishNode(p.factory.NewParameterDeclaration(
-			nil, nil, p.factory.NewIdentifier("args"), nil, p.zigAnyTypeAt(pos), nil,
+			nil, nil, p.factory.NewIdentifier("args"), nil, p.zigUnknownTypeAt(pos), nil,
 		), pos)
 	}
 	var name *ast.Node
@@ -187,7 +199,7 @@ func (p *Parser) parseZigParameter() *ast.Node {
 		name = p.factory.NewIdentifier("arg")
 	}
 	return p.finishNode(p.factory.NewParameterDeclaration(
-		nil, nil, name, nil, p.zigAnyTypeAt(pos), nil,
+		nil, nil, name, nil, p.zigUnknownTypeAt(pos), nil,
 	), pos)
 }
 
@@ -216,11 +228,11 @@ func (p *Parser) parseZigTopLevelBinding(pos int, exported bool) []*ast.Node {
 		p.zigExportModifiers(exported, pos),
 		p.newIdentifierLike(name),
 		nil,
-		p.zigAnyTypeAt(pos),
+		p.zigUnknownTypeAt(pos),
 	), pos)
 
 	decl := p.finishNode(p.factory.NewVariableDeclaration(
-		p.newIdentifierLike(name), nil, p.zigAnyTypeAt(pos), p.zigUndefinedExpression(pos),
+		p.newIdentifierLike(name), nil, p.zigUnknownTypeAt(pos), p.zigUndefinedExpression(pos),
 	), pos)
 	flags := ast.NodeFlagsLet
 	if isConst {
@@ -251,18 +263,19 @@ func (p *Parser) parseZigTest() {
 
 // ---------------------------------------------------------------- type helpers
 
-// zigAnyTypeAt creates an `any` type node anchored at pos.
-func (p *Parser) zigAnyTypeAt(pos int) *ast.Node {
-	node := p.factory.NewKeywordTypeNode(ast.KindAnyKeyword)
+// zigUnknownTypeAt creates an `unknown` type node anchored at pos. The permissive front-end never
+// emits `any`, so unresolved declarations stay assignable but cannot be used unsafely.
+func (p *Parser) zigUnknownTypeAt(pos int) *ast.Node {
+	node := p.factory.NewKeywordTypeNode(ast.KindUnknownKeyword)
 	node.Loc = core.NewTextRange(pos, pos)
 	return node
 }
 
-// zigUndefinedExpression creates a permissive `null as any` value.
+// zigUndefinedExpression creates a permissive `null as unknown` value.
 func (p *Parser) zigUndefinedExpression(pos int) *ast.Node {
 	nullExpr := p.factory.NewToken(ast.KindNullKeyword)
 	nullExpr.Loc = core.NewTextRange(pos, pos)
-	return p.finishNode(p.factory.NewAsExpression(nullExpr, p.zigAnyTypeAt(pos)), pos)
+	return p.finishNode(p.factory.NewAsExpression(nullExpr, p.zigUnknownTypeAt(pos)), pos)
 }
 
 func (p *Parser) zigEmptyBlockAt(pos int) *ast.Node {
