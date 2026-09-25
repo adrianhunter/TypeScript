@@ -204,8 +204,10 @@ func (p *Parser) zigImportDeclaration(name, spec string, pos int, specLoc core.T
 	specLiteral.Loc = core.NewTextRange(-1, -1)
 	hasSpecLoc := specLoc.Pos() >= 0 && specLoc.End() >= specLoc.Pos()
 	if hasSpecLoc {
-		// Keep the original specifier's source range so go-to-definition / Cmd+Click works.
+		// Keep the original specifier's source range so go-to-definition / Cmd+Click works, but
+		// print our normalized text (`./spec.zig`) rather than the raw source range.
 		specLiteral.Loc = specLoc
+		specLiteral.Flags |= ast.NodeFlagsSynthesized
 	}
 	// Bind the module namespace (`import * as X from "./y.zig"`), so `X.Member` resolves and the
 	// binding keeps a real type. Unlike a default import, this does not require the target file to

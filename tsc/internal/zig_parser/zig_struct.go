@@ -636,17 +636,23 @@ func (p *Parser) zigEnumDeclarations(nameNode *ast.Node, members []string, expor
 
 	synthesizedLoc := core.NewTextRange(-1, -1)
 	var typeNodes []*ast.Node
-	var valueMembers []*ast.Node
+	var properties []*ast.Node
 	for _, member := range members {
 		stringLiteral := p.factory.NewStringLiteral(member, ast.TokenFlagsNone)
 		stringLiteral.Loc = synthesizedLoc
 		typeNodes = append(typeNodes, p.finishNodeWithEnd(p.factory.NewLiteralTypeNode(stringLiteral), start, end))
 
+		// Value namespace emitted as `{ readonly "member": "member" }`. A const object (rather than
+		// a namespace of `const`s) is used so member names that are reserved words (e.g. `default`)
+		// are valid property names instead of a syntax error.
+		name := p.factory.NewStringLiteral(member, ast.TokenFlagsNone)
+		name.Loc = synthesizedLoc
 		value := p.factory.NewStringLiteral(member, ast.TokenFlagsNone)
 		value.Loc = synthesizedLoc
-		decl := p.finishNodeWithEnd(p.factory.NewVariableDeclaration(p.newIdentifierAt(member, synthesizedLoc), nil, nil, value), start, end)
-		declList := p.finishNodeWithEnd(p.factory.NewVariableDeclarationList(p.newNodeList(loc, []*ast.Node{decl}), ast.NodeFlagsConst), start, end)
-		valueMembers = append(valueMembers, p.finishNodeWithEnd(p.factory.NewVariableStatement(p.zigExportModifiers(true, start), declList), start, end))
+		literalType := p.finishNodeWithEnd(p.factory.NewLiteralTypeNode(value), start, end)
+		properties = append(properties, p.finishNodeWithEnd(
+			p.factory.NewPropertySignatureDeclaration(nil, name, nil, literalType, nil), start, end,
+		))
 	}
 
 	var typeNode *ast.Node
@@ -665,17 +671,14 @@ func (p *Parser) zigEnumDeclarations(nameNode *ast.Node, members []string, expor
 		typeNode,
 	), start, end)
 
-	moduleBlock := p.finishNodeWithEnd(p.factory.NewModuleBlock(p.newNodeList(loc, valueMembers)), start, end)
-	moduleDecl := p.finishNodeWithEnd(p.factory.NewModuleDeclaration(
-		p.zigExportModifiers(exported, start),
-		ast.KindModuleKeyword,
-		p.newIdentifierLike(nameNode),
-		nil,
-		moduleBlock,
-	), start, end)
-	moduleDecl.Flags |= ast.NodeFlagsModuleFragment
+	objectType := p.finishNodeWithEnd(p.factory.NewTypeLiteralNode(p.newNodeList(loc, properties)), start, end)
+	// A `never` initializer keeps the source declaration valid (`const` must be initialized); it is
+	// elided from the emitted declaration file.
+	decl := p.finishNodeWithEnd(p.factory.NewVariableDeclaration(p.newIdentifierLike(nameNode), nil, objectType, p.zigNeverExpression(start)), start, end)
+	declList := p.finishNodeWithEnd(p.factory.NewVariableDeclarationList(p.newNodeList(loc, []*ast.Node{decl}), ast.NodeFlagsConst), start, end)
+	valueStatement := p.finishNodeWithEnd(p.factory.NewVariableStatement(p.zigExportModifiers(exported, start), declList), start, end)
 
-	return []*ast.Node{typeAlias, moduleDecl}
+	return []*ast.Node{typeAlias, valueStatement}
 }
 
 // zigTypeFactoryReturn returns the `return <container>;` statement for a `fn F(...) type { ... }`
