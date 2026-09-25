@@ -120,6 +120,23 @@ func (p *Parser) parseZigContainerLiteral(pos int) *ast.Expression {
 	return result
 }
 
+// zigResolveFieldType returns the declared type of `field` on the current contextual container type,
+// when the container's fields are known (recorded while parsing its declaration).
+func (p *Parser) zigResolveFieldType(field string) *ast.Node {
+	if p.zigContextualType == nil || p.zigContextualType.Kind != ast.KindTypeReference {
+		return nil
+	}
+	typeName := p.zigContextualType.AsTypeReferenceNode().TypeName
+	if typeName == nil || typeName.Kind != ast.KindIdentifier {
+		return nil
+	}
+	fields, ok := p.zigContainerFields[typeName.Text()]
+	if !ok {
+		return nil
+	}
+	return fields[field]
+}
+
 // parseZigLiteralElement parses one element of a `.{ ... }` literal.
 func (p *Parser) parseZigLiteralElement() *ast.Node {
 	if p.token == ast.KindDotToken {
@@ -137,7 +154,14 @@ func (p *Parser) parseZigLiteralElement() *ast.Node {
 				start = dotStart
 			}
 			p.nextToken() // '='
+			// Use the field's declared type (when known) as the contextual type for the value, so a
+			// nested `.{ ... }` is coerced to the field type rather than the enclosing container.
+			savedContextualType := p.zigContextualType
+			if fieldType := p.zigResolveFieldType(name.Text()); fieldType != nil {
+				p.zigContextualType = fieldType
+			}
 			value := p.parseAssignmentExpressionOrHigher()
+			p.zigContextualType = savedContextualType
 			return p.finishNode(p.factory.NewPropertyAssignment(nil, name, nil, nil, value), start)
 		}
 		// `.name` / `.` (before the `=` is typed) in a struct literal: keep it an object-literal
@@ -380,7 +404,7 @@ func (p *Parser) expandZigStruct(stmt *ast.Node, factories map[string]*zigTypeFa
 	// Case 1: the initializer is a container literal, e.g. `const Counter = struct { ... };`.
 	if init.Kind == ast.KindModuleExpression && p.zigStructExprs[init] {
 		if body := init.AsModuleExpression().Body; body != nil && body.Kind == ast.KindModuleBlock {
-			return p.zigContainerDeclarations(nameNode, body, exported, start, end), true
+			return p.zigContainerDeclarations(nameNode, body, exported, start, end, false), true
 		}
 		return nil, false
 	}
@@ -410,7 +434,7 @@ func (p *Parser) expandZigStruct(stmt *ast.Node, factories map[string]*zigTypeFa
 			// synthesized type name rather than the original `struct { ... }` source text.
 			factory.ret.AsReturnStatement().Expression = p.newIdentifierAt(nameNode.Text(), nameNode.Loc)
 			p.overrideParentInImmediateChildren(factory.ret)
-			return p.zigContainerDeclarations(nameNode, body, exported, start, end), true
+			return p.zigContainerDeclarations(nameNode, body, exported, start, end, false), true
 		}
 	}
 	return nil, false
@@ -565,15 +589,21 @@ func (p *Parser) zigQualifyNestedType(node *ast.Node, container *ast.Node, neste
 // declaration (`module X { ... }`). Fields and `self` methods describe the instance type; the
 // remaining declarations (functions, nested containers, imports) live in the module, which is what
 // Zig containers actually are (a type and a namespace at the same time).
-func (p *Parser) zigContainerDeclarations(nameNode *ast.Node, body *ast.Node, exported bool, start, end int) []*ast.Node {
+func (p *Parser) zigContainerDeclarations(nameNode *ast.Node, body *ast.Node, exported bool, start, end int, isUnion bool) []*ast.Node {
 	// Nested containers and enums are desugared before the members are classified.
 	bodyMembers := p.desugarZigStructs(body.AsModuleBlock().Statements.Nodes)
+	// A `union(enum)` holds exactly one active field, so its fields are optional.
+	var questionToken *ast.Node
+	if isUnion {
+		questionToken = p.factory.NewToken(ast.KindQuestionToken)
+		questionToken.Loc = core.NewTextRange(-1, -1)
+	}
 	var typeMembers, moduleMembers []*ast.Node
 	for _, member := range bodyMembers {
 		if member.Kind == ast.KindPropertyDeclaration {
 			property := member.AsPropertyDeclaration()
 			typeMembers = append(typeMembers, p.finishNodeWithEnd(p.factory.NewPropertySignatureDeclaration(
-				nil, property.Name(), nil, property.Type, nil,
+				nil, property.Name(), questionToken, property.Type, nil,
 			), member.Pos(), member.End()))
 			continue
 		}

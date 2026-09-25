@@ -64,6 +64,7 @@ func (p *Parser) zigTryParseContainer(name *ast.Node, exported bool, pos int) []
 		p.nextToken()
 	}
 	kind := ast.KindUnknown
+	isUnion := false
 	switch {
 	case p.token == ast.KindModuleKeyword: // the scanner maps `struct` to `module`
 		kind = ast.KindModuleKeyword
@@ -79,6 +80,7 @@ func (p *Parser) zigTryParseContainer(name *ast.Node, exported bool, pos int) []
 		return p.zigOpaqueContainer(name, exported, pos)
 	case p.zigIsIdent("union"):
 		kind = ast.KindModuleKeyword
+		isUnion = true
 		p.nextToken()
 	default:
 		p.rewind(state)
@@ -105,6 +107,25 @@ func (p *Parser) zigTryParseContainer(name *ast.Node, exported bool, pos int) []
 	}
 
 	members := p.zigParseContainerMembers()
+	// Record field types so field values in container literals can use them as contextual types.
+	if name != nil {
+		fields := map[string]*ast.Node{}
+		for _, member := range members {
+			if member.Kind != ast.KindPropertyDeclaration {
+				continue
+			}
+			property := member.AsPropertyDeclaration()
+			if propertyName := property.Name(); propertyName != nil && propertyName.Kind == ast.KindIdentifier && property.Type != nil {
+				fields[propertyName.Text()] = property.Type
+			}
+		}
+		if len(fields) > 0 {
+			if p.zigContainerFields == nil {
+				p.zigContainerFields = map[string]map[string]*ast.Node{}
+			}
+			p.zigContainerFields[name.Text()] = fields
+		}
+	}
 	end := p.nodePos()
 	if p.token == ast.KindCloseBraceToken {
 		p.nextToken()
@@ -113,7 +134,7 @@ func (p *Parser) zigTryParseContainer(name *ast.Node, exported bool, pos int) []
 	moduleBlock := p.finishNodeWithEnd(p.factory.NewModuleBlock(
 		p.newNodeList(core.NewTextRange(pos, end), members),
 	), pos, end)
-	return p.zigContainerDeclarations(name, moduleBlock, exported, pos, end)
+	return p.zigContainerDeclarations(name, moduleBlock, exported, pos, end, isUnion)
 }
 
 // zigOpaqueContainer lowers `opaque {}` to an empty interface plus namespace.

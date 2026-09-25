@@ -129,6 +129,11 @@ type Parser struct {
 	zigImportSpecs   map[string]string
 	zigImportSpecLoc map[*ast.Node]core.TextRange
 
+	// zigContainerFields records, per declared container type, the declared type of each field
+	// (`Foo -> { args -> []const []const u8 }`). It lets a field value in a container literal get the
+	// field's type as its contextual type, so nested `.{ ... }` literals are coerced correctly.
+	zigContainerFields map[string]map[string]*ast.Node
+
 	// zigContextualType holds the declared type of a variable declaration while its initializer is
 	// parsed, so Zig's `.{ ... }` literals can be coerced to that type.
 	zigContextualType *ast.Node
@@ -4977,6 +4982,12 @@ func (p *Parser) makeBinaryExpression(left *ast.Expression, operatorToken *ast.N
 }
 
 func (p *Parser) parseUnaryExpressionOrHigher() *ast.Expression {
+	// Zig address-of, including `&.{ ... }`. TypeScript has no pointer type, so the operator is
+	// dropped and the operand is parsed as the value.
+	if p.token == ast.KindAmpersandToken {
+		p.nextToken()
+		return p.parseUnaryExpressionOrHigher()
+	}
 	// ES7 UpdateExpression:
 	//      1) LeftHandSideExpression[?Yield]
 	//      2) LeftHandSideExpression[?Yield][no LineTerminator here]++
@@ -5370,6 +5381,11 @@ func (p *Parser) parseJsxClosingFragment(inExpressionContext bool) *ast.Node {
 
 func (p *Parser) parseSimpleUnaryExpression() *ast.Expression {
 	switch p.token {
+	case ast.KindAmpersandToken:
+		// Zig address-of, including `&.{ ... }`. TypeScript has no pointer type, so the operator is
+		// dropped and the operand is parsed as the value.
+		p.nextToken()
+		return p.parseSimpleUnaryExpression()
 	case ast.KindPlusToken, ast.KindMinusToken, ast.KindTildeToken, ast.KindExclamationToken:
 		return p.parsePrefixUnaryExpression()
 	case ast.KindDeleteKeyword:
