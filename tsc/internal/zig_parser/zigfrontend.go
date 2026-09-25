@@ -649,13 +649,22 @@ func (p *Parser) zigSwitchPayload(subject *ast.Node, tag string, typeInfo bool, 
 
 // zigSwitchCondition builds the condition that selects a switch arm. The tagged `Type` union is
 // discriminated by `tag`; user unions expose each variant as a field of the same name.
-func (p *Parser) zigSwitchCondition(subject *ast.Node, tag string, typeInfo bool, pos int) *ast.Node {
+func (p *Parser) zigSwitchCondition(subject *ast.Node, tag string, typeInfo, hasCapture bool, pos int) *ast.Node {
 	subj := p.factory.DeepCloneReparse(subject)
+	literal := func() *ast.Node {
+		lit := p.factory.NewStringLiteral(tag, ast.TokenFlagsNone)
+		lit.Loc = core.NewTextRange(pos, pos)
+		return lit
+	}
 	if typeInfo {
 		tagAccess := p.finishNode(p.factory.NewPropertyAccessExpression(subj, nil, p.newIdentifier("tag"), ast.NodeFlagsNone), pos)
-		literal := p.factory.NewStringLiteral(tag, ast.TokenFlagsNone)
-		literal.Loc = core.NewTextRange(pos, pos)
-		return p.finishNode(p.factory.NewBinaryExpression(nil, tagAccess, nil, p.factory.NewToken(ast.KindEqualsEqualsEqualsToken), literal), pos)
+		return p.finishNode(p.factory.NewBinaryExpression(nil, tagAccess, nil, p.factory.NewToken(ast.KindEqualsEqualsEqualsToken), literal()), pos)
+	}
+	if !hasCapture {
+		// A bare tag arm (`.a => ...`) compares against the tag value, so TypeScript control-flow
+		// narrowing can collapse the switch to the matched arm (e.g. `const xx: E = .a;` makes a
+		// switch over `xx` resolve to the `.a` branch's literal).
+		return p.finishNode(p.factory.NewBinaryExpression(nil, subj, nil, p.factory.NewToken(ast.KindEqualsEqualsEqualsToken), literal()), pos)
 	}
 	payload := p.finishNode(p.factory.NewPropertyAccessExpression(subj, nil, p.newIdentifier(tag), ast.NodeFlagsNone), pos)
 	unknownPayload := p.finishNodeWithEnd(p.factory.NewAsExpression(payload, p.zigUnknownTypeAt(pos)), pos, pos)
@@ -741,9 +750,10 @@ func (p *Parser) zigTryParseSwitchExpression() *ast.Node {
 	p.nextToken()
 
 	type switchArm struct {
-		tag    string
-		body   *ast.Node
-		isElse bool
+		tag     string
+		capture string
+		body    *ast.Node
+		isElse  bool
 	}
 	var arms []switchArm
 	for p.token != ast.KindCloseBraceToken && p.token != ast.KindEndOfFile {
@@ -790,6 +800,7 @@ func (p *Parser) zigTryParseSwitchExpression() *ast.Node {
 			p.rewind(state)
 			return nil
 		}
+		arm.capture = capture
 		arm.body = p.zigLowerSwitchArm(body, subject, capture, arm.tag, subjectIsTypeInfo, pos)
 		arms = append(arms, arm)
 		if p.token != ast.KindCommaToken && p.token != ast.KindCloseBraceToken {
@@ -813,6 +824,32 @@ func (p *Parser) zigTryParseSwitchExpression() *ast.Node {
 		return nil
 	}
 
+	// A switch whose arms are all bare tags (`.a => value, ...`) lowers to an `as const` object
+	// indexed by the subject. Unlike a conditional chain, TypeScript control-flow narrowing can
+	// collapse `({ a: 123 } as const)[subject]` when `subject` is a known literal.
+	bareTags := len(arms) > 0
+	for _, arm := range arms {
+		if arm.isElse || arm.capture != "" {
+			bareTags = false
+			break
+		}
+	}
+	if bareTags {
+		properties := make([]*ast.Node, 0, len(arms))
+		for _, arm := range arms {
+			key := p.factory.NewStringLiteral(arm.tag, ast.TokenFlagsNone)
+			key.Loc = core.NewTextRange(pos, pos)
+			properties = append(properties, p.finishNode(p.factory.NewPropertyAssignment(nil, key, nil, nil, arm.body), pos))
+		}
+		object := p.finishNode(p.factory.NewObjectLiteralExpression(
+			p.newNodeList(core.NewTextRange(pos, p.nodePos()), properties), true,
+		), pos)
+		constType := p.finishNode(p.factory.NewTypeReferenceNode(p.newIdentifier("const"), nil), pos)
+		asConst := p.finishNode(p.factory.NewAsExpression(object, constType), pos)
+		access := p.finishNode(p.factory.NewElementAccessExpression(asConst, nil, subject, ast.NodeFlagsNone), pos)
+		return p.finishNodeWithEnd(access, pos, p.nodePos())
+	}
+
 	var result *ast.Node
 	for i := len(arms) - 1; i >= 0; i-- {
 		arm := arms[i]
@@ -820,7 +857,7 @@ func (p *Parser) zigTryParseSwitchExpression() *ast.Node {
 			result = arm.body
 			continue
 		}
-		cond := p.zigSwitchCondition(subject, arm.tag, subjectIsTypeInfo, pos)
+		cond := p.zigSwitchCondition(subject, arm.tag, subjectIsTypeInfo, arm.capture != "", pos)
 		result = p.finishNode(p.factory.NewConditionalExpression(cond, nil, arm.body, nil, result), pos)
 	}
 	if result == nil {
