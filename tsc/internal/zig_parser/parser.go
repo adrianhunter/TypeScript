@@ -108,6 +108,10 @@ type Parser struct {
 	// `struct` keyword so they can later be desugared into class/interface/module declarations.
 	inZigStructBody bool
 	zigStructExprs  map[*ast.Node]bool
+
+	// zigContextualType holds the declared type of a variable declaration while its initializer is
+	// parsed, so Zig's `.{ ... }` literals can be coerced to that type.
+	zigContextualType *ast.Node
 }
 
 func newParser() *Parser {
@@ -1635,7 +1639,10 @@ func (p *Parser) parseVariableDeclarationWorker(allowExclamation bool) *ast.Node
 	typeNode := p.parseTypeAnnotation()
 	var initializer *ast.Expression
 	if p.token != ast.KindInKeyword && p.token != ast.KindOfKeyword {
+		savedContextualType := p.zigContextualType
+		p.zigContextualType = typeNode
 		initializer = p.parseInitializer()
+		p.zigContextualType = savedContextualType
 	}
 	result := p.finishNode(p.factory.NewVariableDeclaration(name, exclamationToken, typeNode, initializer), pos)
 	p.withJSDoc(result, jsdoc)
@@ -2030,7 +2037,10 @@ func (p *Parser) parsePropertyDeclaration(pos int, jsdoc jsdocScannerInfo, modif
 		postfixToken = p.parseOptionalToken(ast.KindExclamationToken)
 	}
 	typeNode := p.parseTypeAnnotation()
+	savedContextualType := p.zigContextualType
+	p.zigContextualType = typeNode
 	initializer := p.doInContext(ast.NodeFlagsYieldContext|ast.NodeFlagsAwaitContext|ast.NodeFlagsDisallowInContext, false, (*Parser).parseInitializer)
+	p.zigContextualType = savedContextualType
 	p.parseSemicolonAfterPropertyName(name, typeNode, initializer)
 	result := p.finishNode(p.factory.NewPropertyDeclaration(modifiers, name, postfixToken, typeNode, initializer), pos)
 	p.withJSDoc(result, jsdoc)
@@ -5707,6 +5717,8 @@ func (p *Parser) parsePrimaryExpression() *ast.Expression {
 		if p.lookAhead((*Parser).nextTokenIsOpenBraceOnSameLine) {
 			return p.parseModuleExpression()
 		}
+	case ast.KindDotToken:
+		return p.parseZigDotExpression()
 	}
 	return p.parseIdentifierWithDiagnostic(diagnostics.Expression_expected, nil)
 }
