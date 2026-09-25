@@ -131,7 +131,8 @@ func (p *Parser) zigImportDeclaration(name, spec string, pos int) *ast.Node {
 	}
 	specLiteral := p.factory.NewStringLiteral(moduleSpecifier, ast.TokenFlagsNone)
 	specLiteral.Loc = core.NewTextRange(-1, -1)
-	namespaceImport := p.finishNodeWithEnd(p.factory.NewNamespaceImport(nameIdentifier), pos, pos)
-	importClause := p.finishNodeWithEnd(p.factory.NewImportClause(ast.KindUnknown, nil, namespaceImport), pos, pos)
+	// Resolve the import to the module's default export: a Zig file is itself a container and
+	// default-exports its `Self`, so `const X = @import("y.zig")` binds `X` to that type/value.
+	importClause := p.finishNodeWithEnd(p.factory.NewImportClause(ast.KindUnknown, nameIdentifier, nil), pos, pos)
 	return p.finishNodeWithEnd(p.factory.NewImportDeclaration(nil, importClause, specLiteral, nil), pos, pos)
 }

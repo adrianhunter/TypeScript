@@ -21,6 +21,12 @@ import (
 func (p *Parser) parseZigSourceFile() *ast.SourceFile {
 	pos := p.nodePos()
 	var statements []*ast.Node
+	if p.zigIsContainerBodyFile() {
+		// A file whose top level is a bare container body (`field: Type = value,`) is itself a
+		// container. Lower it to a `Self` class and default-export it so `@import` can resolve to
+		// the file's type.
+		statements = append(statements, p.zigParseSelfContainerFile()...)
+	}
 	for p.token != ast.KindEndOfFile {
 		before := p.scanner.TokenFullStart()
 		statements = append(statements, p.parseZigTopLevel()...)

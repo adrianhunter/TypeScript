@@ -11,6 +11,50 @@ import (
 // interface/namespace/type shapes the strict dialect parser produces, so that declarations such as
 // `Container.Member` and field/method types are preserved in the emitted `.d.ts`.
 
+// zigIsContainerBodyFile reports whether a file's top level is a bare container body, i.e. it starts
+// with `field: Type`. Such a file is itself a container (named `Self`).
+func (p *Parser) zigIsContainerBodyFile() bool {
+	if !tokenIsIdentifierOrKeyword(p.token) {
+		return false
+	}
+	return p.lookAhead(func(pp *Parser) bool {
+		return pp.nextToken() == ast.KindColonToken
+	})
+}
+
+// zigParseSelfContainerFile lowers a bare container-body file to a `Self` class (plus a `Self`
+// namespace for non-field members) and default-exports it, so importers can bind the file to its
+// type via a default import.
+func (p *Parser) zigParseSelfContainerFile() []*ast.Node {
+	members := p.zigParseContainerMembers()
+	var classMembers, namespaceMembers []*ast.Node
+	for _, member := range members {
+		if member.Kind == ast.KindPropertyDeclaration {
+			classMembers = append(classMembers, member)
+			continue
+		}
+		namespaceMembers = append(namespaceMembers, member)
+	}
+	end := p.nodePos()
+	loc := core.NewTextRange(0, len(p.sourceText))
+	synth := core.NewTextRange(-1, -1)
+	out := []*ast.Node{p.finishNode(p.factory.NewClassDeclaration(
+		nil, p.newIdentifierAt("Self", synth), nil, nil, p.newNodeList(loc, classMembers),
+	), 0)}
+	if len(namespaceMembers) > 0 {
+		moduleBlock := p.finishNodeWithEnd(p.factory.NewModuleBlock(p.newNodeList(loc, namespaceMembers)), 0, end)
+		namespace := p.finishNodeWithEnd(p.factory.NewModuleDeclaration(
+			nil, ast.KindModuleKeyword, p.newIdentifierAt("Self", synth), nil, moduleBlock,
+		), 0, end)
+		namespace.Flags |= ast.NodeFlagsModuleFragment
+		out = append(out, namespace)
+	}
+	out = append(out, p.finishNodeWithEnd(p.factory.NewExportAssignment(
+		p.zigExportModifiers(true, 0), false, nil, p.newIdentifierAt("Self", synth),
+	), 0, end))
+	return out
+}
+
 // zigTryParseContainer parses a container literal used as a binding initializer and returns its
 // lowered declarations. It returns nil (and rewinds) when the current token does not start one.
 func (p *Parser) zigTryParseContainer(name *ast.Node, exported bool, pos int) []*ast.Node {
