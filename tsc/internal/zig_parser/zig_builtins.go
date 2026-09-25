@@ -59,29 +59,35 @@ func (p *Parser) parseZigBuiltinExpression() *ast.Expression {
 		if len(args) == 2 {
 			return args[1]
 		}
-	case "hasDecl":
-		if len(args) == 2 {
-			operator := p.factory.NewToken(ast.KindInKeyword)
-			operator.Loc = core.NewTextRange(-1, -1)
-			right := p.finishNodeWithEnd(p.factory.NewAsExpression(args[0], p.zigAnyKeywordType()), -1, -1)
-			binary := p.factory.NewBinaryExpression(nil, args[1], nil, operator, p.wrapZigParen(right))
-			return p.finishNodeWithEnd(binary, pos, p.nodePos())
-		}
-	case "sizeOf", "bitSizeOf", "alignOf":
-		return p.finishNodeWithEnd(p.factory.NewNumericLiteral("0", ast.TokenFlagsNone), pos, p.nodePos())
 	case "typeName":
-		return p.finishNodeWithEnd(p.factory.NewStringLiteral("", ast.TokenFlagsNone), pos, p.nodePos())
-	case "typeInfo":
-		// Lower to the global `typeInfo` from `builtin.ts`, which models `std.builtin.Type`.
-		if len(args) == 1 {
-			callee := p.newIdentifierAt("typeInfo", core.NewTextRange(pos, pos+len("@typeInfo")))
-			argList := p.newNodeList(core.NewTextRange(pos, p.nodePos()), args)
-			return p.finishNode(p.factory.NewCallExpression(callee, nil, nil, argList, ast.NodeFlagsNone), pos)
+		// `@typeName(SomeType)` for a bare type name is a compile-time constant; fold it so the
+		// literal type is available (e.g. `"User"`).
+		if len(args) == 1 && args[0].Kind == ast.KindIdentifier {
+			literal := p.factory.NewStringLiteral(args[0].Text(), ast.TokenFlagsNone)
+			literal.Loc = core.NewTextRange(-1, -1)
+			return p.finishNodeWithEnd(literal, pos, p.nodePos())
 		}
 	}
-	// `@import` and every other builtin (in value position) have no direct equivalent. A
-	// `globalThis` access is a valid expression of type `any` and never leaves an unresolved name.
-	return p.zigGlobalThisAny(pos)
+	// Every other builtin lowers to a call to the matching global function declared in
+	// `src/zig/global.ts`, so the language service has a real signature and return type.
+	return p.zigBuiltinCall(zigBuiltinGlobalName(name), args, pos)
+}
+
+// zigBuiltinGlobalName maps a Zig builtin name to the global function declared for it. The only
+// mismatch is `@export`, whose name is a TypeScript keyword.
+func zigBuiltinGlobalName(name string) string {
+	switch name {
+	case "export":
+		return "exportBuiltin"
+	}
+	return name
+}
+
+// zigBuiltinCall builds `name(args...)` with a synthesized callee at the builtin's position.
+func (p *Parser) zigBuiltinCall(name string, args []*ast.Node, pos int) *ast.Expression {
+	callee := p.newIdentifierAt(name, core.NewTextRange(pos, pos+1+len(name)))
+	argList := p.newNodeList(core.NewTextRange(pos, p.nodePos()), args)
+	return p.finishNode(p.factory.NewCallExpression(callee, nil, nil, argList, ast.NodeFlagsNone), pos)
 }
 
 // zigAnyKeywordType synthesizes an `any` keyword type.
