@@ -2951,7 +2951,10 @@ func (p *Parser) parseNonArrayType() *ast.Node {
 	case ast.KindQuestionToken:
 		return p.parseZigOptionalType()
 	case ast.KindExclamationToken:
-		return p.parseJSDocNonNullableType()
+		// Zig error union `E!T` / `!T`: the error set has no TypeScript equivalent, so only the
+		// payload type is kept.
+		p.nextToken()
+		return p.parseTypeOperatorOrHigher()
 	case ast.KindNoSubstitutionTemplateLiteral, ast.KindStringLiteral, ast.KindNumericLiteral, ast.KindBigIntLiteral, ast.KindTrueKeyword,
 		ast.KindFalseKeyword, ast.KindNullKeyword:
 		return p.parseLiteralTypeNode(false /*negative*/)
@@ -3702,10 +3705,30 @@ func (p *Parser) parseFunctionBlock(flags ParseFlags, diagnosticMessage *diagnos
 	// We may be in a [Decorator] context when parsing a function expression or
 	// arrow function. The body of the function is not in [Decorator] context.
 	p.setContextFlags(ast.NodeFlagsDecoratorContext, false)
+	// Zig function bodies can use control flow (`for ... |x|`, `while ... |x|`,
+	// `try`/`catch`, pointer captures, ...) that the TypeScript grammar does not
+	// model. Function bodies never affect declaration emit, so if the strict parse
+	// of the body fails, the body is skipped instead of failing the whole file.
+	state := p.mark()
 	block := p.parseBlock(flags&ParseFlagsIgnoreMissingOpenBrace != 0, diagnosticMessage)
+	if len(p.diagnostics) > state.diagnosticsLen {
+		p.rewind(state)
+		block = p.zigSkipFunctionBodyBlock()
+	}
 	p.contextFlags = saveContextFlags
 	p.statementHasAwaitIdentifier = saveHasAwaitIdentifier
 	return block
+}
+
+// zigSkipFunctionBodyBlock consumes a function body without parsing it, producing an empty block.
+func (p *Parser) zigSkipFunctionBodyBlock() *ast.Node {
+	pos := p.nodePos()
+	if p.token == ast.KindOpenBraceToken {
+		p.zigSkipBalanced(ast.KindOpenBraceToken, ast.KindCloseBraceToken)
+	} else if p.token == ast.KindSemicolonToken {
+		p.nextToken()
+	}
+	return p.finishNode(p.factory.NewBlock(p.newNodeList(core.NewTextRange(pos, p.nodePos()), nil), true), pos)
 }
 
 func (p *Parser) isIndexSignature() bool {
@@ -5777,6 +5800,17 @@ func (p *Parser) parseTemplateSpan(isTaggedTemplate bool) *ast.Node {
 }
 
 func (p *Parser) parsePrimaryExpression() *ast.Expression {
+	// Zig error literal `error.Name`; there is no TypeScript equivalent, so it degrades to `null`
+	// (which is assignable to the lowered error-union/optional payload types).
+	if p.token == ast.KindIdentifier && p.scanner.TokenValue() == "error" && p.lookAhead((*Parser).nextTokenIsDot) {
+		pos := p.nodePos()
+		p.nextToken() // `error`
+		p.nextToken() // `.`
+		p.parseIdentifierName()
+		nullKeyword := p.factory.NewKeywordExpression(ast.KindNullKeyword)
+		nullKeyword.Loc = core.NewTextRange(-1, -1)
+		return p.finishNode(nullKeyword, pos)
+	}
 	// Zig labeled block expression: `label: { ... break :label value; }`.
 	if p.token == ast.KindIdentifier && p.zigTernaryConsequentDepth == 0 && p.lookAhead((*Parser).nextTokenIsColonThenOpenBrace) {
 		return p.parseZigLabeledBlockExpression()
