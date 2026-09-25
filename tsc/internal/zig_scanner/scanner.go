@@ -44,6 +44,7 @@ type ErrorCallback func(diagnostic *diagnostics.Message, start, length int, args
 var textToKeyword = map[string]ast.Kind{
 	"abstract":    ast.KindAbstractKeyword,
 	"accessor":    ast.KindAccessorKeyword,
+	"and":         ast.KindAmpersandAmpersandToken, // Zig logical and
 	"any":         ast.KindAnyKeyword,
 	"as":          ast.KindAsKeyword,
 	"asserts":     ast.KindAssertsKeyword,
@@ -97,6 +98,8 @@ var textToKeyword = map[string]ast.Kind{
 	"protected":   ast.KindProtectedKeyword,
 	"public":      ast.KindPublicKeyword,
 	"override":    ast.KindOverrideKeyword,
+	"or":          ast.KindBarBarToken,           // Zig logical or
+	"orelse":      ast.KindQuestionQuestionToken, // Zig optional unwrap
 	"out":         ast.KindOutKeyword,
 	"readonly":    ast.KindReadonlyKeyword,
 	"require":     ast.KindRequireKeyword,

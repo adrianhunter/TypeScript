@@ -191,7 +191,7 @@ func (p *Parser) parseZigContainerField() *ast.Node {
 // container literal is modeled as the same triple named `X`. Doing this on real AST nodes (rather
 // than rewriting text) keeps source positions intact for the language service.
 func (p *Parser) desugarZigStructs(statements []*ast.Node) []*ast.Node {
-	if len(p.zigStructExprs) == 0 {
+	if len(p.zigStructExprs) == 0 && len(p.zigEnumExprs) == 0 && len(p.zigImportExprs) == 0 {
 		return statements
 	}
 
@@ -215,6 +215,10 @@ func (p *Parser) desugarZigStructs(statements []*ast.Node) []*ast.Node {
 	changed := false
 	out := make([]*ast.Node, 0, len(statements))
 	for _, stmt := range statements {
+		if p.zigHoistImportBinding(stmt) {
+			changed = true
+			continue
+		}
 		if expanded, ok := p.expandZigStruct(stmt, factories, consumed); ok {
 			out = append(out, expanded...)
 			changed = true
@@ -268,6 +272,13 @@ func (p *Parser) expandZigStruct(stmt *ast.Node, factories map[string]*ast.Node,
 	start, end := stmt.Pos(), stmt.End()
 	exported := ast.HasSyntacticModifier(stmt, ast.ModifierFlagsExport)
 
+	// Case 0: the initializer is an enum container, e.g. `const Color = enum { red, green };`.
+	if init.Kind == ast.KindModuleExpression {
+		if members, ok := p.zigEnumExprs[init]; ok {
+			return p.zigEnumDeclarations(nameNode, members, exported, start, end), true
+		}
+	}
+
 	// Case 1: the initializer is a container literal, e.g. `const Counter = struct { ... };`.
 	if init.Kind == ast.KindModuleExpression && p.zigStructExprs[init] {
 		if body := init.AsModuleExpression().Body; body != nil && body.Kind == ast.KindModuleBlock {
@@ -307,8 +318,10 @@ func (p *Parser) expandZigStruct(stmt *ast.Node, factories map[string]*ast.Node,
 // body. Fields become class properties, `self` methods become interface method signatures, and the
 // remaining members stay in the module namespace.
 func (p *Parser) zigContainerDeclarations(nameNode *ast.Node, body *ast.Node, exported bool, start, end int) []*ast.Node {
+	// Nested containers and enums are desugared before the members are classified.
+	bodyMembers := p.desugarZigStructs(body.AsModuleBlock().Statements.Nodes)
 	var classMembers, interfaceMembers, moduleMembers []*ast.Node
-	for _, member := range body.AsModuleBlock().Statements.Nodes {
+	for _, member := range bodyMembers {
 		if member.Kind == ast.KindPropertyDeclaration {
 			classMembers = append(classMembers, member)
 			continue
@@ -347,6 +360,56 @@ func (p *Parser) zigContainerDeclarations(nameNode *ast.Node, body *ast.Node, ex
 	moduleDecl.Flags |= ast.NodeFlagsModuleFragment
 
 	return []*ast.Node{classDecl, interfaceDecl, moduleDecl}
+}
+
+// zigEnumDeclarations builds the `type X = "a" | "b"` alias and the `namespace X` value namespace
+// for a Zig enum. Enum literals already lower to string literals, so the members are emitted as
+// exported string constants.
+func (p *Parser) zigEnumDeclarations(nameNode *ast.Node, members []string, exported bool, start, end int) []*ast.Node {
+	loc := core.NewTextRange(start, end)
+
+	synthesizedLoc := core.NewTextRange(-1, -1)
+	var typeNodes []*ast.Node
+	var valueMembers []*ast.Node
+	for _, member := range members {
+		stringLiteral := p.factory.NewStringLiteral(member, ast.TokenFlagsNone)
+		stringLiteral.Loc = synthesizedLoc
+		typeNodes = append(typeNodes, p.finishNodeWithEnd(p.factory.NewLiteralTypeNode(stringLiteral), start, end))
+
+		value := p.factory.NewStringLiteral(member, ast.TokenFlagsNone)
+		value.Loc = synthesizedLoc
+		decl := p.finishNodeWithEnd(p.factory.NewVariableDeclaration(p.newIdentifierAt(member, synthesizedLoc), nil, nil, value), start, end)
+		declList := p.finishNodeWithEnd(p.factory.NewVariableDeclarationList(p.newNodeList(loc, []*ast.Node{decl}), ast.NodeFlagsConst), start, end)
+		valueMembers = append(valueMembers, p.finishNodeWithEnd(p.factory.NewVariableStatement(p.zigExportModifiers(true, start), declList), start, end))
+	}
+
+	var typeNode *ast.Node
+	switch len(typeNodes) {
+	case 0:
+		typeNode = p.finishNodeWithEnd(p.factory.NewKeywordTypeNode(ast.KindNeverKeyword), start, end)
+	case 1:
+		typeNode = typeNodes[0]
+	default:
+		typeNode = p.finishNodeWithEnd(p.factory.NewUnionTypeNode(p.newNodeList(loc, typeNodes)), start, end)
+	}
+	typeAlias := p.finishNodeWithEnd(p.factory.NewTypeAliasDeclaration(
+		p.zigExportModifiers(exported, start),
+		p.newIdentifierLike(nameNode),
+		nil,
+		typeNode,
+	), start, end)
+
+	moduleBlock := p.finishNodeWithEnd(p.factory.NewModuleBlock(p.newNodeList(loc, valueMembers)), start, end)
+	moduleDecl := p.finishNodeWithEnd(p.factory.NewModuleDeclaration(
+		p.zigExportModifiers(exported, start),
+		ast.KindModuleKeyword,
+		p.newIdentifierLike(nameNode),
+		nil,
+		moduleBlock,
+	), start, end)
+	moduleDecl.Flags |= ast.NodeFlagsModuleFragment
+
+	return []*ast.Node{typeAlias, moduleDecl}
 }
 
 // zigTypeFactoryReturn returns the `return <container>;` statement for a `fn F(...) type { ... }`

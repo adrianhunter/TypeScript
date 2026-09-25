@@ -109,6 +109,15 @@ type Parser struct {
 	inZigStructBody bool
 	zigStructExprs  map[*ast.Node]bool
 
+	// zigEnumExprs records `enum { ... }` container expressions and the member names parsed from
+	// them, so they can be desugared into a union type plus a value namespace.
+	zigEnumExprs map[*ast.Node][]string
+
+	// zigImportExprs records the `@import("spec")` expressions parsed in this file, and
+	// zigHoistedImports collects the top-level `import`/`const` declarations synthesized for them.
+	zigImportExprs    map[*ast.Node]string
+	zigHoistedImports []*ast.Node
+
 	// zigContextualType holds the declared type of a variable declaration while its initializer is
 	// parsed, so Zig's `.{ ... }` literals can be coerced to that type.
 	zigContextualType *ast.Node
@@ -468,8 +477,12 @@ func (p *Parser) parseSourceFileWorker() *ast.SourceFile {
 	}
 	pos := p.nodePos()
 	statements := p.parseListIndex(PCSourceElements, (*Parser).parseToplevelStatement)
-	if len(p.zigStructExprs) != 0 {
+	if len(p.zigStructExprs) != 0 || len(p.zigEnumExprs) != 0 || len(p.zigImportExprs) != 0 {
 		statements = p.desugarZigStructs(statements)
+	}
+	if len(p.zigHoistedImports) != 0 {
+		statements = append(p.zigHoistedImports, statements...)
+		p.zigHoistedImports = nil
 	}
 	end := p.nodePos()
 	endJSDoc := p.jsdocScannerInfo()
@@ -1561,6 +1574,16 @@ func (p *Parser) parseExpressionOrLabeledStatement() *ast.Statement {
 	hasParen := p.token == ast.KindOpenParenToken
 	expression := p.parseExpression()
 
+	// Zig discards a value with `_ = expr;`. Lower it to the bare expression so the value is still
+	// evaluated for its side effects without introducing an unresolved `_` binding.
+	if expression.Kind == ast.KindBinaryExpression {
+		binary := expression.AsBinaryExpression()
+		if binary.OperatorToken != nil && binary.OperatorToken.Kind == ast.KindEqualsToken &&
+			binary.Left != nil && binary.Left.Kind == ast.KindIdentifier && binary.Left.Text() == "_" {
+			expression = binary.Right
+		}
+	}
+
 	if expression.Kind == ast.KindIdentifier && p.parseOptional(ast.KindColonToken) {
 		result := p.finishNode(p.factory.NewLabeledStatement(expression, p.parseStatement()), pos)
 		p.withJSDoc(result, jsdoc)
@@ -2326,7 +2349,7 @@ func (p *Parser) parseModuleBlock() *ast.Node {
 			parseElement = (*Parser).parseZigContainerMember
 		}
 		statements = p.parseList(PCBlockStatements, parseElement)
-		if len(p.zigStructExprs) != 0 {
+		if len(p.zigStructExprs) != 0 || len(p.zigEnumExprs) != 0 || len(p.zigImportExprs) != 0 {
 			statements.Nodes = p.desugarZigStructs(statements.Nodes)
 		}
 		p.parseExpected(ast.KindCloseBraceToken)
@@ -2899,13 +2922,13 @@ func (p *Parser) parseNonArrayType() *ast.Node {
 		p.scanner.ReScanAsteriskEqualsToken()
 		fallthrough
 	case ast.KindAsteriskToken:
-		return p.parseJSDocAllType()
+		return p.parseZigPointerType()
 	case ast.KindQuestionQuestionToken:
 		// If there is '??', treat it as prefix-'?' in JSDoc type.
 		p.scanner.ReScanQuestionToken()
-		fallthrough
-	case ast.KindQuestionToken:
 		return p.parseJSDocNullableType()
+	case ast.KindQuestionToken:
+		return p.parseZigOptionalType()
 	case ast.KindExclamationToken:
 		return p.parseJSDocNonNullableType()
 	case ast.KindNoSubstitutionTemplateLiteral, ast.KindStringLiteral, ast.KindNumericLiteral, ast.KindBigIntLiteral, ast.KindTrueKeyword,
@@ -2935,7 +2958,7 @@ func (p *Parser) parseNonArrayType() *ast.Node {
 		}
 		return p.parseTypeLiteral()
 	case ast.KindOpenBracketToken:
-		return p.parseTupleType()
+		return p.parseZigArrayOrSliceType()
 	case ast.KindOpenParenToken:
 		return p.parseParenthesizedType()
 	case ast.KindImportKeyword:
@@ -3025,6 +3048,10 @@ func (p *Parser) parseLiteralTypeNode(negative bool) *ast.Node {
 
 func (p *Parser) parseTypeReference() *ast.Node {
 	pos := p.nodePos()
+	if kind, ok := p.zigBuiltinTypeAtCurrent(); ok {
+		p.nextToken()
+		return p.finishNode(p.factory.NewKeywordTypeNode(kind), pos)
+	}
 	return p.finishNode(p.factory.NewTypeReferenceNode(p.parseEntityNameOfTypeReference(), p.parseTypeArgumentsOfTypeReference()), pos)
 }
 
@@ -5542,6 +5569,12 @@ func (p *Parser) nextTokenIsIdentifierOrKeywordOrOpenBracketOrTemplate() bool {
 
 func (p *Parser) parsePropertyAccessExpressionRest(pos int, expression *ast.Expression, questionDotToken *ast.Node) *ast.Node {
 	name := p.parseRightSideOfDot(true /*allowIdentifierNames*/, true /*allowPrivateIdentifiers*/, true /*allowUnicodeEscapeSequenceInIdentifierName*/)
+	// Zig slices expose their length as `len`; map it to the JavaScript `length` property.
+	if name.Kind == ast.KindIdentifier && name.Text() == "len" {
+		length := p.factory.NewIdentifier("length")
+		length.Loc = core.NewTextRange(-1, -1)
+		name = length
+	}
 	isOptionalChain := questionDotToken != nil || p.tryReparseOptionalChain(expression)
 	propertyAccess := p.factory.NewPropertyAccessExpression(expression, questionDotToken, name, core.IfElse(isOptionalChain, ast.NodeFlagsOptionalChain, ast.NodeFlagsNone))
 	if isOptionalChain && ast.IsPrivateIdentifier(name) {
@@ -5594,6 +5627,18 @@ func (p *Parser) parseElementAccessExpressionRest(pos int, expression *ast.Expre
 func (p *Parser) parseCallExpressionRest(pos int, expression *ast.Expression) *ast.Expression {
 	for {
 		expression = p.parseMemberExpressionRest(pos, expression /*allowOptionalChain*/, true)
+		// Zig struct initialization: `Type{ ... }`. Parse the brace body as a container literal and
+		// coerce it to the named type. `Type{}` keeps every field default.
+		if p.token == ast.KindOpenBraceToken {
+			if typeNode := p.zigExpressionToTypeNode(expression); typeNode != nil {
+				literalPos := p.nodePos()
+				savedContextualType := p.zigContextualType
+				p.zigContextualType = typeNode
+				expression = p.parseZigContainerLiteral(literalPos)
+				p.zigContextualType = savedContextualType
+				continue
+			}
+		}
 		var typeArguments *ast.NodeList
 		questionDotToken := p.parseOptionalToken(ast.KindQuestionDotToken)
 		if questionDotToken != nil {
@@ -5718,6 +5763,9 @@ func (p *Parser) parsePrimaryExpression() *ast.Expression {
 		}
 		return p.parseFunctionExpression()
 	case ast.KindAtToken:
+		if p.lookAhead((*Parser).nextTokenIsIdentifierOrKeywordOnSameLine) {
+			return p.parseZigBuiltinExpression()
+		}
 		return p.parseDecoratedExpression()
 	case ast.KindClassKeyword:
 		return p.parseClassExpression()
@@ -5736,6 +5784,10 @@ func (p *Parser) parsePrimaryExpression() *ast.Expression {
 	case ast.KindModuleKeyword:
 		if p.lookAhead((*Parser).nextTokenIsOpenBraceOnSameLine) {
 			return p.parseModuleExpression()
+		}
+	case ast.KindEnumKeyword:
+		if p.lookAhead((*Parser).nextTokenIsOpenBraceOnSameLine) {
+			return p.parseZigEnumExpression()
 		}
 	case ast.KindDotToken:
 		return p.parseZigDotExpression()
