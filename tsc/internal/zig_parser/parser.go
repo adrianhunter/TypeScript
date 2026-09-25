@@ -555,12 +555,14 @@ func (p *Parser) parseSourceFileWorker() *ast.SourceFile {
 	}
 	pos := p.nodePos()
 	statements := p.parseListIndex(PCSourceElements, (*Parser).parseToplevelStatement)
-	if len(p.zigStructExprs) != 0 || len(p.zigEnumExprs) != 0 || len(p.zigImportExprs) != 0 {
-		statements = p.desugarZigStructs(statements)
-	}
-	if len(p.zigHoistedImports) != 0 {
-		statements = append(p.zigHoistedImports, statements...)
-		p.zigHoistedImports = nil
+	if !p.opts.SkipZigDesugar {
+		if len(p.zigStructExprs) != 0 || len(p.zigEnumExprs) != 0 || len(p.zigImportExprs) != 0 {
+			statements = p.desugarZigStructs(statements)
+		}
+		if len(p.zigHoistedImports) != 0 {
+			statements = append(p.zigHoistedImports, statements...)
+			p.zigHoistedImports = nil
+		}
 	}
 	end := p.nodePos()
 	endJSDoc := p.jsdocScannerInfo()

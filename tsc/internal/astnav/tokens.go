@@ -581,6 +581,10 @@ func findRightmostValidToken(endPos int, sourceFile *ast.SourceFile, containingN
 					tokens = append(tokens, sourceFile.GetOrCreateToken(token, tokenFullStart, tokenEnd, n, flags))
 					scanner.Scan()
 				}
+				if visitedNode.End() < 0 {
+					// Synthesized node (e.g. lowered Zig construct); nothing to scan.
+					continue
+				}
 				startPos = visitedNode.End()
 				scanner.ResetPos(startPos)
 				scanner.Scan()

@@ -12,13 +12,41 @@ import (
 	"github.com/microsoft/TypeScript/tsc/internal/format"
 	"github.com/microsoft/TypeScript/tsc/internal/ls/lsutil"
 	"github.com/microsoft/TypeScript/tsc/internal/lsp/lsproto"
+	"github.com/microsoft/TypeScript/tsc/internal/parser"
 	"github.com/microsoft/TypeScript/tsc/internal/scanner"
 	"github.com/microsoft/TypeScript/tsc/internal/spanmap"
+	"github.com/microsoft/TypeScript/tsc/internal/tspath"
 )
 
+// formattingFile returns the file to run the AST formatter against. For Zig it re-parses the source
+// without lowering containers, so the AST mirrors the text and the formatter's structural edits are
+// correct.
+func (l *LanguageService) formattingFile(file *ast.SourceFile) *ast.SourceFile {
+	if file == nil || !tspath.FileExtensionIs(file.FileName(), tspath.ExtensionZig) {
+		return file
+	}
+	opts := file.ParseOptions()
+	opts.SkipZigDesugar = true
+	return parser.ParseSourceFile(opts, file.Text(), file.ScriptKind)
+}
+
 func (l *LanguageService) toLSProtoTextEdits(file *ast.SourceFile, changes []core.TextChange) []*lsproto.TextEdit {
-	result := make([]*lsproto.TextEdit, 0, len(changes))
-	for _, c := range changes {
+	// Sort and drop malformed/overlapping changes. Synthesized Zig constructs can make the formatter
+	// emit an inverted or overlapping edit, which clients reject as a whole (applying nothing).
+	sorted := slices.Clone(changes)
+	slices.SortStableFunc(sorted, func(a, b core.TextChange) int {
+		if c := cmp.Compare(a.Pos(), b.Pos()); c != 0 {
+			return c
+		}
+		return cmp.Compare(a.End(), b.End())
+	})
+	result := make([]*lsproto.TextEdit, 0, len(sorted))
+	lastEnd := -1
+	for _, c := range sorted {
+		if c.Pos() > c.End() || c.Pos() < lastEnd {
+			continue
+		}
+		lastEnd = c.End()
 		lspRange, fidelity := l.converters.ToLSPRange(file, core.NewTextRange(c.Pos(), c.End()))
 		if !fidelity.IsExact() {
 			return nil
@@ -43,7 +71,7 @@ func (l *LanguageService) ProvideFormatDocument(
 	formatOpts := lsutil.FromLSFormatOptions(l.FormatOptions(), options)
 	var edits []*lsproto.TextEdit
 	if file.ContentMapper() == "" {
-		edits = l.toLSProtoTextEdits(file, l.getFormattingEditsForDocument(ctx, file, formatOpts))
+		edits = l.toLSProtoTextEdits(file, l.getFormattingEditsForDocument(ctx, l.formattingFile(file), formatOpts))
 	} else {
 		edits = l.getFormattingEditsForMappedRange(ctx, file, formatOpts, core.NewTextRange(0, len(file.OriginalText())))
 	}
@@ -170,7 +198,7 @@ func (l *LanguageService) ProvideFormatDocumentRange(
 	file = ranges[0].Script
 	edits := l.toLSProtoTextEdits(file, l.getFormattingEditsForRange(
 		ctx,
-		file,
+		l.formattingFile(file),
 		formatOpts,
 		ranges[0].Span,
 	))
@@ -196,7 +224,7 @@ func (l *LanguageService) ProvideFormatDocumentOnType(
 	file = positions[0].Script
 	edits := l.toLSProtoTextEdits(file, l.getFormattingEditsAfterKeystroke(
 		ctx,
-		file,
+		l.formattingFile(file),
 		formatOpts,
 		int(positions[0].Position),
 		character,

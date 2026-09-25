@@ -9,6 +9,9 @@ type SourceFileParseOptions struct {
 	FileName                       string
 	Path                           tspath.Path
 	ExternalModuleIndicatorOptions ExternalModuleIndicatorOptions
+	// SkipZigDesugar parses Zig containers without lowering them to class/module/namespace
+	// declarations. Used when the AST must mirror the source text (e.g. for formatting).
+	SkipZigDesugar bool
 }
 
 type ExternalModuleIndicatorOptions struct {

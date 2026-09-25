@@ -345,9 +345,8 @@ func (w *formatSpanWorker) processChildNode(
 	isListItem bool,
 	isFirstListItem bool,
 ) int {
-	debug.Assert(!ast.NodeIsSynthesized(child))
-
-	if ast.NodeIsMissing(child) || child.Flags&ast.NodeFlagsReparsed != 0 {
+	// Synthesized children (e.g. lowered Zig declarations) have no source text to format; skip them.
+	if ast.NodeIsSynthesized(child) || ast.NodeIsMissing(child) || child.Flags&ast.NodeFlagsReparsed != 0 {
 		return inheritedIndentation
 	}
 	childStartPos := scanner.GetTokenPosOfNode(child, w.sourceFile, false)
@@ -407,7 +406,10 @@ func (w *formatSpanWorker) processChildNode(
 		tokenInfo := w.formattingScanner.readTokenInfo(child)
 		// JSX text shouldn't affect indenting
 		if child.Kind != ast.KindJsxText {
-			debug.Assert(tokenInfo.token.Loc.End() == child.Loc.End(), "Token end is child end")
+			if tokenInfo.token.Loc.End() != child.Loc.End() {
+				// Synthesized/misaligned token (e.g. from a lowered Zig construct); leave it alone.
+				return inheritedIndentation
+			}
 			w.consumeTokenAndAdvanceScanner(tokenInfo, node, parentDynamicIndentation, child, false)
 			return inheritedIndentation
 		}
@@ -446,9 +448,9 @@ func (w *formatSpanWorker) processChildNodes(
 	parentStartLine int,
 	parentDynamicIndentation *dynamicIndenter,
 ) {
-	debug.Assert(nodes != nil)
-	debug.Assert(!ast.PositionIsSynthesized(nodes.Pos()))
-	debug.Assert(!ast.PositionIsSynthesized(nodes.End()))
+	if nodes == nil || ast.PositionIsSynthesized(nodes.Pos()) || ast.PositionIsSynthesized(nodes.End()) {
+		return
+	}
 
 	listStartToken := getOpenTokenForList(parent, nodes)
 
