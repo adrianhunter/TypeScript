@@ -196,8 +196,11 @@ var zigDialectUnsupportedPatterns = []*regexp.Regexp{
 	regexp.MustCompile(`\berror\s*\{`),                     // error sets `error{ ... }`
 	regexp.MustCompile(`@Vector\b`),                        // `@Vector(...)`
 	regexp.MustCompile(`\bextern\s+(struct|union|enum)\b`), // extern containers
-	regexp.MustCompile(`[:(]\s*[^,;()\n"]*\b\w+\.\w+`),    // qualified type annotations, e.g. `x: std.mem.Allocator`
 }
+
+// zigQualifiedTypeRootPattern captures the root of a qualified name used in type position, e.g. the
+// `std` in `x: std.mem.Allocator` or the `plan9` in `sys: plan9.SYS`.
+var zigQualifiedTypeRootPattern = regexp.MustCompile(`[:(]\s*[^,;()\n"]*\b(\w+)\.`)
 
 // zigImportBindingPattern captures the name of a `const X = @import(...)` binding.
 var zigImportBindingPattern = regexp.MustCompile(`(?m)^[ \t]*(?:pub[ \t]+)?const[ \t]+(\w+)[ \t]*=[ \t]*@import\s*\(`)
@@ -247,6 +250,13 @@ func zigDialectUnsupported(sourceText string) bool {
 		return false
 	}
 	for _, match := range zigQualifiedAliasPattern.FindAllStringSubmatch(sourceText, -1) {
+		if imports[match[1]] {
+			return true
+		}
+	}
+	// Qualified types rooted at an imported module (`x: std.mem.Allocator`) cannot be resolved by
+	// the strict parser the same way; locally-declared containers (`x: Foo.X`) can.
+	for _, match := range zigQualifiedTypeRootPattern.FindAllStringSubmatch(sourceText, -1) {
 		if imports[match[1]] {
 			return true
 		}
